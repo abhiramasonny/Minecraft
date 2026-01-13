@@ -21,11 +21,21 @@ FetchContent_MakeAvailable(glfw)
 find_package(OpenGL REQUIRED)
 
 add_executable(renderer
-  src/main.cpp
-  src/stb_image.cpp
+  src/app/main.cpp
+  src/app/save.cpp
+  src/core/math.cpp
+  src/core/perlin.cpp
+  src/game/player.cpp
+  src/game/world.cpp
+  src/game/inventory.cpp
+  src/game/ui.cpp
+  src/render/textures.cpp
+  src/render/renderer.cpp
+  src/third_party/stb_image.cpp
 )
 
 target_link_libraries(renderer PRIVATE glfw OpenGL::GL)
+target_include_directories(renderer PRIVATE src)
 
 if(APPLE)
   target_compile_definitions(renderer PRIVATE GL_SILENCE_DEPRECATION)
