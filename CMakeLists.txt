@@ -22,6 +22,7 @@ find_package(OpenGL REQUIRED)
 
 add_executable(renderer
   src/main.cpp
+  src/stb_image.cpp
 )
 
 target_link_libraries(renderer PRIVATE glfw OpenGL::GL)
