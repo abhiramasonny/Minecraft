@@ -14,12 +14,23 @@ Vec3 cross(Vec3 a, Vec3 b) {
   };
 }
 
+float fast_inverse_sqrt(float number) {
+  float x2 = number * 0.5f;
+  float y = number;
+  uint32_t i = *reinterpret_cast<uint32_t*>(&y);
+  i = 0x5f3759df - (i >> 1);
+  y = *reinterpret_cast<float*>(&i);
+  y = y * (1.5f - (x2 * y * y));
+  return y;
+}
+
 Vec3 normalize(Vec3 v) {
-  float len = std::sqrt(dot(v, v));
-  if (len <= 0.00001f) {
+  float len_sq = dot(v, v);
+  if (len_sq <= 0.001f) {
     return {0.0f, 0.0f, 0.0f};
   }
-  return {v.x / len, v.y / len, v.z / len};
+  float inv_len = fast_inverse_sqrt(len_sq);
+  return {v.x * inv_len, v.y * inv_len, v.z * inv_len};
 }
 
 float radians(float degrees) {

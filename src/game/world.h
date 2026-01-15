@@ -31,19 +31,23 @@ enum BlockType : uint8_t {
 };
 
 struct Vertex {
-  float x;
-  float y;
-  float z;
-  float u;
-  float v;
-  float r;
-  float g;
-  float b;
+  int16_t x;
+  int16_t y;
+  int16_t z;
+  int16_t u;
+  int16_t v;
+  int8_t nx;
+  int8_t ny;
+  int8_t nz;
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
 };
 
-struct Quad {
-  Vertex v[4];
+struct MeshBatch {
   unsigned int textureId;
+  int indexOffset;
+  int indexCount;
 };
 
 struct Chunk {
@@ -51,7 +55,14 @@ struct Chunk {
   int cy;
   int cz;
   std::vector<uint8_t> blocks;
-  std::vector<Quad> quads;
+  std::vector<uint8_t> light;
+  std::vector<Vertex> vertices;
+  std::vector<uint32_t> indices;
+  std::vector<MeshBatch> batches;
+  unsigned int vbo;
+  unsigned int ibo;
+  bool meshDirty;
+  int lodStep;
 };
 
 struct ChunkCoord {
@@ -75,6 +86,19 @@ struct ChunkCoordHash {
   }
 };
 
+struct MeshBuildResult {
+  ChunkCoord coord;
+  int lodStep;
+  std::vector<Vertex> vertices;
+  std::vector<uint32_t> indices;
+  std::vector<MeshBatch> batches;
+};
+
+struct MeshBuildTask {
+  ChunkCoord coord;
+  std::future<MeshBuildResult> future;
+};
+
 struct ChunkBuildTask {
   ChunkCoord coord;
   std::future<Chunk> future;
@@ -85,13 +109,17 @@ struct World {
   int renderDistance;
   std::unordered_map<ChunkCoord, Chunk, ChunkCoordHash> chunks;
   std::unordered_set<ChunkCoord, ChunkCoordHash> queuedChunks;
+  std::unordered_set<ChunkCoord, ChunkCoordHash> queuedMeshes;
   std::vector<ChunkBuildTask> buildTasks;
+  std::vector<MeshBuildTask> meshTasks;
   std::vector<ChunkCoord> visibleChunks;
   std::vector<ChunkCoord> pendingChunks;
 };
 
 void initWorld(World& world);
-void updateWorldChunks(World& world, const TextureAssets& textures, Vec3 playerPosition);
+void updateWorldChunks(World& world, const TextureAssets& textures, Vec3 playerPosition,
+                       Vec3 cameraFront, Vec3 cameraUp, Vec3 cameraRight,
+                       float fovDegrees, float aspect);
 void rebuildWorldMeshes(World& world, const TextureAssets& textures);
 float groundHeightAt(const World& world, float x, float y, float z, bool& valid);
 BlockType blockAt(const World& world, int wx, int wy, int wz);
@@ -102,4 +130,5 @@ bool raycastBlock(const World& world, Vec3 origin, Vec3 direction, float maxDist
 bool hasBlockNear(const World& world, Vec3 position, BlockType type, int radius);
 bool isPlaceableBlock(BlockType type);
 const Chunk* findChunk(const World& world, int cx, int cy, int cz);
+Chunk* findChunkMutable(World& world, int cx, int cy, int cz);
 float surfaceHeightAt(const World& world, float x, float z);

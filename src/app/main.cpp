@@ -1,6 +1,7 @@
 #include <GLFW/glfw3.h>
 
 #include <cstdio>
+#include <cmath>
 
 #include "game/inventory.h"
 #include "core/math.h"
@@ -19,9 +20,78 @@ struct AppState {
   UiState ui;
   bool prevBreakDown;
   bool prevPlaceDown;
+  bool showChunkBounds;
+  bool showWireframe;
+  bool showCoords;
+  bool prevBoundsDown;
+  bool prevWireframeDown;
+  bool prevCoordsDown;
 };
 
 static constexpr float kBlockReach = 6.0f;
+static constexpr float kDayLength = 120.0f;
+static constexpr float kFovDegrees = 60.0f;
+static constexpr float kFarPlane = 600.0f;
+static constexpr float kChunkSize = 16.0f;
+
+static WorldLight updateSun(double timeNow) {
+  float cycle = static_cast<float>(std::fmod(timeNow, kDayLength) / kDayLength);
+  float angle = cycle * 2.0f * 3.1415926f;
+  float sunX = std::cos(angle);
+  float sunY = std::sin(angle);
+  float sunZ = 0.2f;
+
+  float dayFactor = std::max(0.0f, sunY);
+  float ambient = 0.15f + dayFactor * 0.35f;
+  float diffuse = 0.2f + dayFactor * 0.8f;
+
+  float lightDir[4] = {-sunX, -sunY, -sunZ, 0.0f};
+  float ambientColor[4] = {ambient, ambient, ambient + 0.05f, 1.0f};
+  float diffuseColor[4] = {diffuse, diffuse * 0.95f, diffuse * 0.9f, 1.0f};
+
+  glLightfv(GL_LIGHT0, GL_POSITION, lightDir);
+  glLightfv(GL_LIGHT0, GL_AMBIENT, ambientColor);
+  glLightfv(GL_LIGHT0, GL_DIFFUSE, diffuseColor);
+
+  float skyR = 0.08f + dayFactor * 0.4f;
+  float skyG = 0.1f + dayFactor * 0.45f;
+  float skyB = 0.16f + dayFactor * 0.55f;
+  glClearColor(skyR, skyG, skyB, 1.0f);
+
+  WorldLight light = {};
+  light.direction = normalize({-sunX, -sunY, -sunZ});
+  light.ambient = {ambientColor[0], ambientColor[1], ambientColor[2]};
+  light.diffuse = {diffuseColor[0], diffuseColor[1], diffuseColor[2]};
+  return light;
+}
+
+static void toggleFlag(bool down, bool& prevDown, bool& flag) {
+  if (down && !prevDown) {
+    flag = !flag;
+  }
+  prevDown = down;
+}
+
+static void updateWindowTitle(GLFWwindow* window, const AppState& app) {
+  if (!app.showCoords) {
+    glfwSetWindowTitle(window, "Renderer");
+    return;
+  }
+
+  int bx = static_cast<int>(std::floor(app.player.position.x));
+  int by = static_cast<int>(std::floor(app.player.position.y));
+  int bz = static_cast<int>(std::floor(app.player.position.z));
+  int cx = static_cast<int>(std::floor(app.player.position.x / kChunkSize));
+  int cy = static_cast<int>(std::floor(app.player.position.y / kChunkSize));
+  int cz = static_cast<int>(std::floor(app.player.position.z / kChunkSize));
+
+  char title[128];
+  std::snprintf(title, sizeof(title),
+                "Renderer | Pos %.1f %.1f %.1f | Block %d %d %d | Chunk %d %d %d",
+                app.player.position.x, app.player.position.y, app.player.position.z,
+                bx, by, bz, cx, cy, cz);
+  glfwSetWindowTitle(window, title);
+}
 
 static void framebufferSizeCallback(GLFWwindow* window, int width, int height) {
   (void)window;
@@ -49,6 +119,12 @@ static void initApp(AppState& app) {
   initUi(app.ui);
   app.prevBreakDown = false;
   app.prevPlaceDown = false;
+  app.showChunkBounds = false;
+  app.showWireframe = false;
+  app.showCoords = false;
+  app.prevBoundsDown = false;
+  app.prevWireframeDown = false;
+  app.prevCoordsDown = false;
 }
 
 static void tryBreakBlock(AppState& app) {
@@ -217,8 +293,18 @@ int main() {
 
   glEnable(GL_DEPTH_TEST);
   glEnable(GL_TEXTURE_2D);
+  glEnable(GL_LIGHTING);
+  glEnable(GL_LIGHT0);
+  glEnable(GL_COLOR_MATERIAL);
+  glEnable(GL_CULL_FACE);
+  glCullFace(GL_BACK);
+  glFrontFace(GL_CW);
+  glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
+  glShadeModel(GL_SMOOTH);
   glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
   glClearColor(0.08f, 0.09f, 0.12f, 1.0f);
+
+  initRenderer();
 
   loadTextures(app.textures);
   bool loaded = loadGame("save/world.bin", app.world, app.player, app.inventory, app.textures);
@@ -226,7 +312,13 @@ int main() {
     float surface = surfaceHeightAt(app.world, app.player.position.x, app.player.position.z);
     app.player.position.y = surface + 2.0f;
   }
-  updateWorldChunks(app.world, app.textures, app.player.position);
+  int initWidth = 0;
+  int initHeight = 0;
+  glfwGetFramebufferSize(window, &initWidth, &initHeight);
+  float initAspect = (initHeight > 0) ? static_cast<float>(initWidth) / static_cast<float>(initHeight) : 1.0f;
+  updateWorldChunks(app.world, app.textures, app.player.position,
+                    app.player.front, app.player.up, app.player.right,
+                    kFovDegrees, initAspect);
   rebuildWorldMeshes(app.world, app.textures);
 
   double lastFrame = glfwGetTime();
@@ -244,9 +336,11 @@ int main() {
     bool toggled = toggleInventory(app.ui, toggleDown);
     handleInventoryToggle(window, app, toggled);
 
-    updateHotbarSelection(app, window);
+    toggleFlag(glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS, app.prevBoundsDown, app.showChunkBounds);
+    toggleFlag(glfwGetKey(window, GLFW_KEY_V) == GLFW_PRESS, app.prevWireframeDown, app.showWireframe);
+    toggleFlag(glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS, app.prevCoordsDown, app.showCoords);
 
-    updateWorldChunks(app.world, app.textures, app.player.position);
+    updateHotbarSelection(app, window);
 
     bool mouseDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
     bool rightDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
@@ -311,10 +405,18 @@ int main() {
     updatePlayerPhysics(app.player, app.world, deltaTime);
 
     float aspect = static_cast<float>(width) / static_cast<float>(height);
-    Mat4 proj = perspective(60.0f, aspect, 0.1f, 600.0f);
+    updateWorldChunks(app.world, app.textures, app.player.position,
+                      app.player.front, app.player.up, app.player.right,
+                      kFovDegrees, aspect);
+
+    updateWindowTitle(window, app);
+
+    Mat4 proj = perspective(kFovDegrees, aspect, 0.1f, kFarPlane);
     Mat4 view = lookAt(app.player.position, app.player.position + app.player.front, app.player.up);
 
     glViewport(0, 0, width, height);
+    WorldLight worldLight = updateSun(currentFrame);
+    setWorldLight(worldLight);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     glMatrixMode(GL_PROJECTION);
@@ -323,7 +425,23 @@ int main() {
     glMatrixMode(GL_MODELVIEW);
     glLoadMatrixf(view.m);
 
+    bool wireframe = app.showWireframe;
+    if (wireframe) {
+      glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+      glDisable(GL_CULL_FACE);
+    }
+
+    uploadVisibleChunkMeshes(app.world);
     drawWorld(app.world);
+
+    if (wireframe) {
+      glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+      glEnable(GL_CULL_FACE);
+    }
+
+    if (app.showChunkBounds) {
+      drawChunkBounds(app.world);
+    }
     if (!app.ui.inventoryOpen) {
       int hitX = 0;
       int hitY = 0;
@@ -345,6 +463,7 @@ int main() {
   }
 
   saveGame("save/world.bin", app.world, app.player, app.inventory);
+  shutdownRenderer();
   glfwDestroyWindow(window);
   glfwTerminate();
   return 0;

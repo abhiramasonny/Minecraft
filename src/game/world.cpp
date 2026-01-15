@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <future>
 #include <thread>
+#include <algorithm>
 
 namespace {
 struct Color {
@@ -28,13 +29,68 @@ constexpr int kChunkVolume = kChunkSize * kChunkSize * kChunkSize;
 constexpr int kChunksY = 12;
 constexpr int kWorldY = kChunkSize * kChunksY;
 constexpr float kBlockSize = 1.0f;
-constexpr int kDefaultRenderDistance = 2;
-constexpr int kVerticalRenderDistance = 1;
+constexpr float kChunkHalfSize = kChunkSize * 0.5f * kBlockSize;
+constexpr float kChunkRadius = kChunkHalfSize * 1.7320508f;
+constexpr int kDefaultRenderDistance = 6;
+constexpr int kVerticalRenderDistance = 3;
 constexpr int kChunkBuildPerFrame = 1;
 constexpr int kMeshBuildPerFrame = 2;
+constexpr int kMaxLightLevel = 15;
+constexpr int kLodDistanceMid = 3;
+constexpr int kLodDistanceFar = 6;
+constexpr int kFarLodRing = 2;
+
+static_assert(sizeof(Vertex) == 16, "Packed vertex size mismatch.");
 
 int blockIndex(int x, int y, int z) {
   return x + kChunkSize * (y + kChunkSize * z);
+}
+
+BlockType blockAtLocal(const Chunk& chunk, int lx, int ly, int lz) {
+  return static_cast<BlockType>(chunk.blocks[blockIndex(lx, ly, lz)]);
+}
+
+BlockType blockAtNeighbor(const Chunk& chunk, const Chunk* neighbor,
+                          int lx, int ly, int lz, int dx, int dy, int dz) {
+  int nx = lx + dx;
+  int ny = ly + dy;
+  int nz = lz + dz;
+  if (nx >= 0 && nx < kChunkSize && ny >= 0 && ny < kChunkSize && nz >= 0 && nz < kChunkSize) {
+    return static_cast<BlockType>(chunk.blocks[blockIndex(nx, ny, nz)]);
+  }
+  if (!neighbor || neighbor->blocks.empty()) {
+    return BlockAir;
+  }
+  if (nx < 0) nx = kChunkSize - 1;
+  else if (nx >= kChunkSize) nx = 0;
+  if (ny < 0) ny = kChunkSize - 1;
+  else if (ny >= kChunkSize) ny = 0;
+  if (nz < 0) nz = kChunkSize - 1;
+  else if (nz >= kChunkSize) nz = 0;
+  return static_cast<BlockType>(neighbor->blocks[blockIndex(nx, ny, nz)]);
+}
+
+uint8_t lightAtNeighbor(const Chunk& chunk, const Chunk* neighbor,
+                        int lx, int ly, int lz, int dx, int dy, int dz) {
+  int nx = lx + dx;
+  int ny = ly + dy;
+  int nz = lz + dz;
+  if (nx >= 0 && nx < kChunkSize && ny >= 0 && ny < kChunkSize && nz >= 0 && nz < kChunkSize) {
+    if (chunk.light.empty()) {
+      return 0u;
+    }
+    return chunk.light[blockIndex(nx, ny, nz)];
+  }
+  if (!neighbor || neighbor->light.empty()) {
+    return 0u;
+  }
+  if (nx < 0) nx = kChunkSize - 1;
+  else if (nx >= kChunkSize) nx = 0;
+  if (ny < 0) ny = kChunkSize - 1;
+  else if (ny >= kChunkSize) ny = 0;
+  if (nz < 0) nz = kChunkSize - 1;
+  else if (nz >= kChunkSize) nz = 0;
+  return neighbor->light[blockIndex(nx, ny, nz)];
 }
 
 int floorDiv(int value, int divisor) {
@@ -52,6 +108,10 @@ int floorMod(int value, int divisor) {
     mod += std::abs(divisor);
   }
   return mod;
+}
+
+bool isLightBlocking(BlockType type) {
+  return type != BlockAir && type != BlockStick;
 }
 
 ChunkCoord chunkCoord(int cx, int cy, int cz) {
@@ -93,6 +153,23 @@ BlockType blockAtInternal(const World& world, int wx, int wy, int wz) {
   return static_cast<BlockType>(chunk->blocks[blockIndex(lx, ly, lz)]);
 }
 
+uint8_t lightAtInternal(const World& world, int wx, int wy, int wz) {
+  if (wy < 0 || wy >= kWorldY) {
+    return 0u;
+  }
+  int cx = floorDiv(wx, kChunkSize);
+  int cy = floorDiv(wy, kChunkSize);
+  int cz = floorDiv(wz, kChunkSize);
+  const Chunk* chunk = findChunkInternal(world, cx, cy, cz);
+  if (!chunk || chunk->light.empty()) {
+    return 0u;
+  }
+  int lx = floorMod(wx, kChunkSize);
+  int ly = floorMod(wy, kChunkSize);
+  int lz = floorMod(wz, kChunkSize);
+  return chunk->light[blockIndex(lx, ly, lz)];
+}
+
 void setBlockInternal(Chunk& chunk, int wx, int wy, int wz, BlockType type) {
   int lx = floorMod(wx, kChunkSize);
   int ly = floorMod(wy, kChunkSize);
@@ -100,18 +177,46 @@ void setBlockInternal(Chunk& chunk, int wx, int wy, int wz, BlockType type) {
   chunk.blocks[blockIndex(lx, ly, lz)] = static_cast<uint8_t>(type);
 }
 
-Vertex makeVertex(Vec3 pos, float u, float v, Color color) {
-  return {pos.x, pos.y, pos.z, u, v, color.r, color.g, color.b};
+int8_t normalToByte(float value) {
+  value = std::max(-1.0f, std::min(1.0f, value));
+  return static_cast<int8_t>(std::lround(value * 127.0f));
 }
 
-void addQuad(std::vector<Quad>& quads, unsigned int textureId, Color color, Vec3 a, Vec3 b, Vec3 c, Vec3 d) {
-  Quad quad;
-  quad.textureId = textureId;
-  quad.v[0] = makeVertex(a, 0.0f, 0.0f, color);
-  quad.v[1] = makeVertex(b, 1.0f, 0.0f, color);
-  quad.v[2] = makeVertex(c, 1.0f, 1.0f, color);
-  quad.v[3] = makeVertex(d, 0.0f, 1.0f, color);
-  quads.push_back(quad);
+uint8_t colorToByte(float value);
+
+int16_t coordToShort(float value) {
+  return static_cast<int16_t>(std::lround(value));
+}
+
+Vertex makeVertex(Vec3 pos, float u, float v, Vec3 normal, Color color) {
+  return {
+    coordToShort(pos.x),
+    coordToShort(pos.y),
+    coordToShort(pos.z),
+    coordToShort(u),
+    coordToShort(v),
+    normalToByte(normal.x),
+    normalToByte(normal.y),
+    normalToByte(normal.z),
+    colorToByte(color.r),
+    colorToByte(color.g),
+    colorToByte(color.b),
+  };
+}
+
+void addQuad(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices, Vec3 normal, Color color,
+             Vec3 a, Vec3 b, Vec3 c, Vec3 d, float uScale, float vScale) {
+  uint32_t base = static_cast<uint32_t>(vertices.size());
+  vertices.push_back(makeVertex(a, 0.0f, 0.0f, normal, color));
+  vertices.push_back(makeVertex(b, uScale, 0.0f, normal, color));
+  vertices.push_back(makeVertex(c, uScale, vScale, normal, color));
+  vertices.push_back(makeVertex(d, 0.0f, vScale, normal, color));
+  indices.push_back(base + 0u);
+  indices.push_back(base + 1u);
+  indices.push_back(base + 2u);
+  indices.push_back(base + 0u);
+  indices.push_back(base + 2u);
+  indices.push_back(base + 3u);
 }
 
 BlockTextures texturesFor(BlockType type, const TextureAssets& textures) {
@@ -165,6 +270,209 @@ Vec3 lerpVec3(Vec3 a, Vec3 b, float t) {
 
 Color tintColor(Color base, Vec3 tint) {
   return {base.r * tint.x, base.g * tint.y, base.b * tint.z};
+}
+
+Color scaleColor(Color base, float factor) {
+  return {base.r * factor, base.g * factor, base.b * factor};
+}
+
+Vec3 biomeTintAt(int x, int z, uint32_t seed);
+
+struct FaceKey {
+  unsigned int textureId;
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
+};
+
+struct FaceCell {
+  bool visible;
+  FaceKey key;
+};
+
+bool operator==(const FaceKey& a, const FaceKey& b) {
+  return a.textureId == b.textureId && a.r == b.r && a.g == b.g && a.b == b.b;
+}
+
+uint8_t colorToByte(float value) {
+  value = clamp01(value);
+  return static_cast<uint8_t>(std::lround(value * 255.0f));
+}
+
+Color colorFromKey(const FaceKey& key) {
+  float inv = 1.0f / 255.0f;
+  return {key.r * inv, key.g * inv, key.b * inv};
+}
+
+enum class FaceDir {
+  Top,
+  Bottom,
+  XPos,
+  XNeg,
+  ZPos,
+  ZNeg,
+};
+
+FaceKey faceKeyFor(BlockType type, FaceDir face, int wx, int wz, uint32_t seed, uint8_t light,
+                   const TextureAssets& textures) {
+  float baseShade = 1.0f;
+  Color topColor = shadeColor(baseShade);
+  Color sideColor = shadeColor(baseShade * 0.95f);
+  Color bottomColor = shadeColor(baseShade * 0.85f);
+  Vec3 biomeTint = {1.0f, 1.0f, 1.0f};
+
+  if (type == BlockGrass) {
+    biomeTint = biomeTintAt(wx, wz, seed);
+    topColor = tintColor(shadeColor(baseShade * 1.05f), biomeTint);
+    sideColor = shadeColor(baseShade * 0.9f);
+    bottomColor = shadeColor(baseShade * 0.7f);
+  } else if (type == BlockLeaves) {
+    biomeTint = biomeTintAt(wx, wz, seed);
+    Vec3 leafTint = {biomeTint.x * 0.85f, biomeTint.y * 0.9f, biomeTint.z * 0.85f};
+    topColor = tintColor(shadeColor(baseShade * 1.0f), leafTint);
+    sideColor = tintColor(shadeColor(baseShade * 0.95f), leafTint);
+    bottomColor = tintColor(shadeColor(baseShade * 0.9f), leafTint);
+  }
+
+  BlockTextures blockTextures = texturesFor(type, textures);
+  Color faceColor = sideColor;
+  unsigned int textureId = blockTextures.side;
+  switch (face) {
+    case FaceDir::Top:
+      faceColor = topColor;
+      textureId = blockTextures.top;
+      break;
+    case FaceDir::Bottom:
+      faceColor = bottomColor;
+      textureId = blockTextures.bottom;
+      break;
+    case FaceDir::XPos:
+    case FaceDir::XNeg:
+    case FaceDir::ZPos:
+      faceColor = sideColor;
+      textureId = blockTextures.side;
+      break;
+    case FaceDir::ZNeg:
+      faceColor = sideColor;
+      textureId = blockTextures.front;
+      break;
+  }
+
+  float ambientMin = 0.3f;
+  float invMax = 1.0f / static_cast<float>(kMaxLightLevel);
+  float lightFactor = ambientMin + (1.0f - ambientMin) * (static_cast<float>(light) * invMax);
+  Color lit = scaleColor(faceColor, lightFactor);
+  return {textureId, colorToByte(lit.r), colorToByte(lit.g), colorToByte(lit.b)};
+}
+
+BlockType sampleBlockRegion(const Chunk& chunk, int lx, int ly, int lz, int step) {
+  if (step == 1) {
+    return blockAtLocal(chunk, lx, ly, lz);
+  }
+  for (int y = 0; y < step; ++y) {
+    for (int z = 0; z < step; ++z) {
+      for (int x = 0; x < step; ++x) {
+        BlockType type = blockAtLocal(chunk, lx + x, ly + y, lz + z);
+        if (type != BlockAir) {
+          return type;
+        }
+      }
+    }
+  }
+  return BlockAir;
+}
+
+bool regionIsFullySolid(const Chunk& chunk, int lx, int ly, int lz, int step) {
+  for (int y = 0; y < step; ++y) {
+    for (int z = 0; z < step; ++z) {
+      for (int x = 0; x < step; ++x) {
+        if (blockAtLocal(chunk, lx + x, ly + y, lz + z) == BlockAir) {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+bool neighborRegionIsFullySolid(const Chunk& chunk, const Chunk* neighbor,
+                                int lx, int ly, int lz, int step, int dx, int dy, int dz) {
+  int nx = lx + dx * step;
+  int ny = ly + dy * step;
+  int nz = lz + dz * step;
+  if (nx >= 0 && nx + step <= kChunkSize &&
+      ny >= 0 && ny + step <= kChunkSize &&
+      nz >= 0 && nz + step <= kChunkSize) {
+    return regionIsFullySolid(chunk, nx, ny, nz, step);
+  }
+  if (!neighbor) {
+    return false;
+  }
+  if (nx < 0) {
+    nx = kChunkSize - step;
+  } else if (nx + step > kChunkSize) {
+    nx = 0;
+  }
+  if (ny < 0) {
+    ny = kChunkSize - step;
+  } else if (ny + step > kChunkSize) {
+    ny = 0;
+  }
+  if (nz < 0) {
+    nz = kChunkSize - step;
+  } else if (nz + step > kChunkSize) {
+    nz = 0;
+  }
+  return regionIsFullySolid(*neighbor, nx, ny, nz, step);
+}
+
+uint8_t lightAtMacroNeighbor(const Chunk& chunk, const Chunk* neighbor,
+                             int lx, int ly, int lz, int step, int dx, int dy, int dz) {
+  int sx = lx + (dx > 0 ? step - 1 : 0);
+  int sy = ly + (dy > 0 ? step - 1 : 0);
+  int sz = lz + (dz > 0 ? step - 1 : 0);
+  return lightAtNeighbor(chunk, neighbor, sx, sy, sz, dx, dy, dz);
+}
+
+template <typename EmitFunc>
+void greedyMask(int width, int height, std::vector<FaceCell>& mask, EmitFunc emit) {
+  for (int v = 0; v < height; ++v) {
+    for (int u = 0; u < width; ++u) {
+      int index = v * width + u;
+      if (!mask[index].visible) {
+        continue;
+      }
+      FaceKey key = mask[index].key;
+      int w = 1;
+      while (u + w < width) {
+        int idx = v * width + (u + w);
+        if (!mask[idx].visible || !(mask[idx].key == key)) {
+          break;
+        }
+        ++w;
+      }
+      int h = 1;
+      bool done = false;
+      while (v + h < height && !done) {
+        for (int k = 0; k < w; ++k) {
+          int idx = (v + h) * width + (u + k);
+          if (!mask[idx].visible || !(mask[idx].key == key)) {
+            done = true;
+            break;
+          }
+        }
+        if (!done) {
+          ++h;
+        }
+      }
+      emit(u, v, w, h, key);
+      for (int dv = 0; dv < h; ++dv) {
+        for (int du = 0; du < w; ++du) {
+          mask[(v + dv) * width + (u + du)].visible = false;
+        }
+      }
+    }
+  }
 }
 
 float hash01(int x, int z, uint32_t seed) {
@@ -404,73 +712,491 @@ void generateChunk(Chunk& chunk, uint32_t seed) {
   }
 }
 
-void buildChunkMesh(const World& world, const TextureAssets& textures, Chunk& chunk) {
-  chunk.quads.clear();
+void computeChunkLight(const World& world, Chunk& chunk) {
+  chunk.light.assign(kChunkVolume, 0u);
+  std::vector<int> queue;
+  queue.reserve(kChunkVolume);
+
+  int baseX = chunk.cx * kChunkSize;
+  int baseY = chunk.cy * kChunkSize;
+  int baseZ = chunk.cz * kChunkSize;
+  int topY = baseY + kChunkSize - 1;
 
   for (int lx = 0; lx < kChunkSize; ++lx) {
-    for (int ly = 0; ly < kChunkSize; ++ly) {
-      for (int lz = 0; lz < kChunkSize; ++lz) {
-        int wx = chunk.cx * kChunkSize + lx;
-        int wy = chunk.cy * kChunkSize + ly;
-        int wz = chunk.cz * kChunkSize + lz;
+    int wx = baseX + lx;
+    for (int lz = 0; lz < kChunkSize; ++lz) {
+      int wz = baseZ + lz;
+      bool blocked = false;
+      for (int wy = kWorldY - 1; wy > topY; --wy) {
+        if (isLightBlocking(blockAtInternal(world, wx, wy, wz))) {
+          blocked = true;
+          break;
+        }
+      }
 
+      for (int wy = topY; wy >= baseY; --wy) {
         BlockType type = blockAtInternal(world, wx, wy, wz);
-        if (type == BlockAir) {
+        if (isLightBlocking(type)) {
+          blocked = true;
           continue;
         }
-
-        float x0 = static_cast<float>(wx) * kBlockSize;
-        float x1 = x0 + kBlockSize;
-        float y0 = wy * kBlockSize;
-        float y1 = y0 + kBlockSize;
-        float z0 = static_cast<float>(wz) * kBlockSize;
-        float z1 = z0 + kBlockSize;
-
-        float baseShade = 0.65f + 0.35f * (static_cast<float>(wy) / (kWorldY - 1));
-        Color topColor = shadeColor(baseShade);
-        Color sideColor = shadeColor(baseShade * 0.92f);
-        Color bottomColor = shadeColor(baseShade * 0.75f);
-        BlockTextures blockTextures = texturesFor(type, textures);
-        Vec3 biomeTint = biomeTintAt(wx, wz, world.seed);
-
-        if (type == BlockGrass) {
-          topColor = tintColor(shadeColor(baseShade * 1.05f), biomeTint);
-          sideColor = shadeColor(baseShade * 0.9f);
-          bottomColor = shadeColor(baseShade * 0.7f);
-        } else if (type == BlockLeaves) {
-          Vec3 leafTint = {biomeTint.x * 0.85f, biomeTint.y * 0.9f, biomeTint.z * 0.85f};
-          topColor = tintColor(shadeColor(baseShade * 1.0f), leafTint);
-          sideColor = tintColor(shadeColor(baseShade * 0.95f), leafTint);
-          bottomColor = tintColor(shadeColor(baseShade * 0.9f), leafTint);
+        if (blocked) {
+          continue;
         }
-
-        if (blockAtInternal(world, wx, wy + 1, wz) == BlockAir) {
-          addQuad(chunk.quads, blockTextures.top, topColor,
-                  {x0, y1, z0}, {x1, y1, z0}, {x1, y1, z1}, {x0, y1, z1});
-        }
-        if (blockAtInternal(world, wx, wy - 1, wz) == BlockAir) {
-          addQuad(chunk.quads, blockTextures.bottom, bottomColor,
-                  {x0, y0, z1}, {x1, y0, z1}, {x1, y0, z0}, {x0, y0, z0});
-        }
-        if (blockAtInternal(world, wx + 1, wy, wz) == BlockAir) {
-          addQuad(chunk.quads, blockTextures.side, sideColor,
-                  {x1, y0, z0}, {x1, y0, z1}, {x1, y1, z1}, {x1, y1, z0});
-        }
-        if (blockAtInternal(world, wx - 1, wy, wz) == BlockAir) {
-          addQuad(chunk.quads, blockTextures.side, sideColor,
-                  {x0, y0, z1}, {x0, y0, z0}, {x0, y1, z0}, {x0, y1, z1});
-        }
-        if (blockAtInternal(world, wx, wy, wz + 1) == BlockAir) {
-          addQuad(chunk.quads, blockTextures.side, sideColor,
-                  {x0, y0, z1}, {x1, y0, z1}, {x1, y1, z1}, {x0, y1, z1});
-        }
-        if (blockAtInternal(world, wx, wy, wz - 1) == BlockAir) {
-          addQuad(chunk.quads, blockTextures.front, sideColor,
-                  {x1, y0, z0}, {x0, y0, z0}, {x0, y1, z0}, {x1, y1, z0});
+        int ly = wy - baseY;
+        int index = blockIndex(lx, ly, lz);
+        if (chunk.light[index] == 0u) {
+          chunk.light[index] = static_cast<uint8_t>(kMaxLightLevel);
+          queue.push_back(index);
         }
       }
     }
   }
+
+  size_t head = 0;
+  while (head < queue.size()) {
+    int index = queue[head++];
+    int lx = index % kChunkSize;
+    int ly = (index / kChunkSize) % kChunkSize;
+    int lz = index / (kChunkSize * kChunkSize);
+    uint8_t light = chunk.light[index];
+    if (light <= 1u) {
+      continue;
+    }
+    int wx = baseX + lx;
+    int wy = baseY + ly;
+    int wz = baseZ + lz;
+    const int offsets[6][3] = {
+      {1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+      {0, -1, 0}, {0, 0, 1}, {0, 0, -1},
+    };
+    for (const auto& offset : offsets) {
+      int nx = wx + offset[0];
+      int ny = wy + offset[1];
+      int nz = wz + offset[2];
+      if (!blockInsideChunk(chunk, nx, ny, nz)) {
+        continue;
+      }
+      if (isLightBlocking(blockAtInternal(world, nx, ny, nz))) {
+        continue;
+      }
+      int nlx = nx - baseX;
+      int nly = ny - baseY;
+      int nlz = nz - baseZ;
+      int nindex = blockIndex(nlx, nly, nlz);
+      uint8_t nextLight = static_cast<uint8_t>(light - 1u);
+      if (chunk.light[nindex] + 1u <= nextLight) {
+        chunk.light[nindex] = nextLight;
+        queue.push_back(nindex);
+      }
+    }
+  }
+}
+
+struct TempBatch {
+  unsigned int textureId;
+  std::vector<Vertex> vertices;
+  std::vector<uint32_t> indices;
+};
+
+TempBatch& getBatch(std::vector<TempBatch>& batches, unsigned int textureId) {
+  for (auto& batch : batches) {
+    if (batch.textureId == textureId) {
+      return batch;
+    }
+  }
+  batches.push_back(TempBatch{textureId, {}, {}});
+  return batches.back();
+}
+
+void buildChunkMesh(const TextureAssets& textures, Chunk& chunk, int lodStep, uint32_t seed,
+                    const Chunk* chunkXPos, const Chunk* chunkXNeg,
+                    const Chunk* chunkYPos, const Chunk* chunkYNeg,
+                    const Chunk* chunkZPos, const Chunk* chunkZNeg) {
+  if (lodStep < 1 || (kChunkSize % lodStep) != 0) {
+    lodStep = 1;
+  }
+  int size = kChunkSize / lodStep;
+
+  chunk.vertices.clear();
+  chunk.indices.clear();
+  chunk.batches.clear();
+
+  int baseX = chunk.cx * kChunkSize;
+  int baseY = chunk.cy * kChunkSize;
+  int baseZ = chunk.cz * kChunkSize;
+  float stepSize = kBlockSize * static_cast<float>(lodStep);
+
+  std::vector<TempBatch> tempBatches;
+  tempBatches.reserve(8);
+
+  std::vector<FaceCell> mask(size * size);
+
+  for (int x = 0; x < size; ++x) {
+    for (int y = 0; y < size; ++y) {
+      for (int z = 0; z < size; ++z) {
+        int lx = x * lodStep;
+        int ly = y * lodStep;
+        int lz = z * lodStep;
+        int index = y * size + z;
+        BlockType type = sampleBlockRegion(chunk, lx, ly, lz, lodStep);
+        if (type == BlockAir ||
+            neighborRegionIsFullySolid(chunk, chunkXPos, lx, ly, lz, lodStep, 1, 0, 0)) {
+          mask[index].visible = false;
+          continue;
+        }
+        uint8_t light = lightAtMacroNeighbor(chunk, chunkXPos, lx, ly, lz, lodStep, 1, 0, 0);
+        int wx = baseX + lx;
+        int wz = baseZ + lz;
+        mask[index] = {true, faceKeyFor(type, FaceDir::XPos, wx, wz, seed, light, textures)};
+      }
+    }
+    greedyMask(size, size, mask, [&](int u, int v, int w, int h, const FaceKey& key) {
+      float xPlane = static_cast<float>(x * lodStep + lodStep) * kBlockSize;
+      float y0 = static_cast<float>(v * lodStep) * kBlockSize;
+      float y1 = y0 + stepSize * static_cast<float>(h);
+      float z0 = static_cast<float>(u * lodStep) * kBlockSize;
+      float z1 = z0 + stepSize * static_cast<float>(w);
+      TempBatch& batch = getBatch(tempBatches, key.textureId);
+      addQuad(batch.vertices, batch.indices, {1.0f, 0.0f, 0.0f}, colorFromKey(key),
+              {xPlane, y0, z0}, {xPlane, y0, z1}, {xPlane, y1, z1}, {xPlane, y1, z0},
+              static_cast<float>(w * lodStep), static_cast<float>(h * lodStep));
+    });
+  }
+
+  for (int x = 0; x < size; ++x) {
+    for (int y = 0; y < size; ++y) {
+      for (int z = 0; z < size; ++z) {
+        int lx = x * lodStep;
+        int ly = y * lodStep;
+        int lz = z * lodStep;
+        int index = y * size + z;
+        BlockType type = sampleBlockRegion(chunk, lx, ly, lz, lodStep);
+        if (type == BlockAir ||
+            neighborRegionIsFullySolid(chunk, chunkXNeg, lx, ly, lz, lodStep, -1, 0, 0)) {
+          mask[index].visible = false;
+          continue;
+        }
+        uint8_t light = lightAtMacroNeighbor(chunk, chunkXNeg, lx, ly, lz, lodStep, -1, 0, 0);
+        int wx = baseX + lx;
+        int wz = baseZ + lz;
+        mask[index] = {true, faceKeyFor(type, FaceDir::XNeg, wx, wz, seed, light, textures)};
+      }
+    }
+    greedyMask(size, size, mask, [&](int u, int v, int w, int h, const FaceKey& key) {
+      float xPlane = static_cast<float>(x * lodStep) * kBlockSize;
+      float y0 = static_cast<float>(v * lodStep) * kBlockSize;
+      float y1 = y0 + stepSize * static_cast<float>(h);
+      float z0 = static_cast<float>(u * lodStep) * kBlockSize;
+      float z1 = z0 + stepSize * static_cast<float>(w);
+      TempBatch& batch = getBatch(tempBatches, key.textureId);
+      addQuad(batch.vertices, batch.indices, {-1.0f, 0.0f, 0.0f}, colorFromKey(key),
+              {xPlane, y0, z1}, {xPlane, y0, z0}, {xPlane, y1, z0}, {xPlane, y1, z1},
+              static_cast<float>(w * lodStep), static_cast<float>(h * lodStep));
+    });
+  }
+
+  for (int y = 0; y < size; ++y) {
+    for (int z = 0; z < size; ++z) {
+      for (int x = 0; x < size; ++x) {
+        int lx = x * lodStep;
+        int ly = y * lodStep;
+        int lz = z * lodStep;
+        int index = z * size + x;
+        BlockType type = sampleBlockRegion(chunk, lx, ly, lz, lodStep);
+        if (type == BlockAir ||
+            neighborRegionIsFullySolid(chunk, chunkYPos, lx, ly, lz, lodStep, 0, 1, 0)) {
+          mask[index].visible = false;
+          continue;
+        }
+        uint8_t light = lightAtMacroNeighbor(chunk, chunkYPos, lx, ly, lz, lodStep, 0, 1, 0);
+        int wx = baseX + lx;
+        int wz = baseZ + lz;
+        mask[index] = {true, faceKeyFor(type, FaceDir::Top, wx, wz, seed, light, textures)};
+      }
+    }
+    greedyMask(size, size, mask, [&](int u, int v, int w, int h, const FaceKey& key) {
+      float yPlane = static_cast<float>(y * lodStep + lodStep) * kBlockSize;
+      float x0 = static_cast<float>(u * lodStep) * kBlockSize;
+      float x1 = x0 + stepSize * static_cast<float>(w);
+      float z0 = static_cast<float>(v * lodStep) * kBlockSize;
+      float z1 = z0 + stepSize * static_cast<float>(h);
+      TempBatch& batch = getBatch(tempBatches, key.textureId);
+      addQuad(batch.vertices, batch.indices, {0.0f, 1.0f, 0.0f}, colorFromKey(key),
+              {x0, yPlane, z0}, {x1, yPlane, z0}, {x1, yPlane, z1}, {x0, yPlane, z1},
+              static_cast<float>(w * lodStep), static_cast<float>(h * lodStep));
+    });
+  }
+
+  for (int y = 0; y < size; ++y) {
+    for (int z = 0; z < size; ++z) {
+      for (int x = 0; x < size; ++x) {
+        int lx = x * lodStep;
+        int ly = y * lodStep;
+        int lz = z * lodStep;
+        int index = z * size + x;
+        BlockType type = sampleBlockRegion(chunk, lx, ly, lz, lodStep);
+        if (type == BlockAir ||
+            neighborRegionIsFullySolid(chunk, chunkYNeg, lx, ly, lz, lodStep, 0, -1, 0)) {
+          mask[index].visible = false;
+          continue;
+        }
+        uint8_t light = lightAtMacroNeighbor(chunk, chunkYNeg, lx, ly, lz, lodStep, 0, -1, 0);
+        int wx = baseX + lx;
+        int wz = baseZ + lz;
+        mask[index] = {true, faceKeyFor(type, FaceDir::Bottom, wx, wz, seed, light, textures)};
+      }
+    }
+    greedyMask(size, size, mask, [&](int u, int v, int w, int h, const FaceKey& key) {
+      float yPlane = static_cast<float>(y * lodStep) * kBlockSize;
+      float x0 = static_cast<float>(u * lodStep) * kBlockSize;
+      float x1 = x0 + stepSize * static_cast<float>(w);
+      float z0 = static_cast<float>(v * lodStep) * kBlockSize;
+      float z1 = z0 + stepSize * static_cast<float>(h);
+      TempBatch& batch = getBatch(tempBatches, key.textureId);
+      addQuad(batch.vertices, batch.indices, {0.0f, -1.0f, 0.0f}, colorFromKey(key),
+              {x0, yPlane, z1}, {x1, yPlane, z1}, {x1, yPlane, z0}, {x0, yPlane, z0},
+              static_cast<float>(w * lodStep), static_cast<float>(h * lodStep));
+    });
+  }
+
+  for (int z = 0; z < size; ++z) {
+    for (int y = 0; y < size; ++y) {
+      for (int x = 0; x < size; ++x) {
+        int lx = x * lodStep;
+        int ly = y * lodStep;
+        int lz = z * lodStep;
+        int index = y * size + x;
+        BlockType type = sampleBlockRegion(chunk, lx, ly, lz, lodStep);
+        if (type == BlockAir ||
+            neighborRegionIsFullySolid(chunk, chunkZPos, lx, ly, lz, lodStep, 0, 0, 1)) {
+          mask[index].visible = false;
+          continue;
+        }
+        uint8_t light = lightAtMacroNeighbor(chunk, chunkZPos, lx, ly, lz, lodStep, 0, 0, 1);
+        int wx = baseX + lx;
+        int wz = baseZ + lz;
+        mask[index] = {true, faceKeyFor(type, FaceDir::ZPos, wx, wz, seed, light, textures)};
+      }
+    }
+    greedyMask(size, size, mask, [&](int u, int v, int w, int h, const FaceKey& key) {
+      float zPlane = static_cast<float>(z * lodStep + lodStep) * kBlockSize;
+      float x0 = static_cast<float>(u * lodStep) * kBlockSize;
+      float x1 = x0 + stepSize * static_cast<float>(w);
+      float y0 = static_cast<float>(v * lodStep) * kBlockSize;
+      float y1 = y0 + stepSize * static_cast<float>(h);
+      TempBatch& batch = getBatch(tempBatches, key.textureId);
+      addQuad(batch.vertices, batch.indices, {0.0f, 0.0f, 1.0f}, colorFromKey(key),
+              {x1, y0, zPlane}, {x0, y0, zPlane}, {x0, y1, zPlane}, {x1, y1, zPlane},
+              static_cast<float>(w * lodStep), static_cast<float>(h * lodStep));
+    });
+  }
+
+  for (int z = 0; z < size; ++z) {
+    for (int y = 0; y < size; ++y) {
+      for (int x = 0; x < size; ++x) {
+        int lx = x * lodStep;
+        int ly = y * lodStep;
+        int lz = z * lodStep;
+        int index = y * size + x;
+        BlockType type = sampleBlockRegion(chunk, lx, ly, lz, lodStep);
+        if (type == BlockAir ||
+            neighborRegionIsFullySolid(chunk, chunkZNeg, lx, ly, lz, lodStep, 0, 0, -1)) {
+          mask[index].visible = false;
+          continue;
+        }
+        uint8_t light = lightAtMacroNeighbor(chunk, chunkZNeg, lx, ly, lz, lodStep, 0, 0, -1);
+        int wx = baseX + lx;
+        int wz = baseZ + lz;
+        mask[index] = {true, faceKeyFor(type, FaceDir::ZNeg, wx, wz, seed, light, textures)};
+      }
+    }
+    greedyMask(size, size, mask, [&](int u, int v, int w, int h, const FaceKey& key) {
+      float zPlane = static_cast<float>(z * lodStep) * kBlockSize;
+      float x0 = static_cast<float>(u * lodStep) * kBlockSize;
+      float x1 = x0 + stepSize * static_cast<float>(w);
+      float y0 = static_cast<float>(v * lodStep) * kBlockSize;
+      float y1 = y0 + stepSize * static_cast<float>(h);
+      TempBatch& batch = getBatch(tempBatches, key.textureId);
+      addQuad(batch.vertices, batch.indices, {0.0f, 0.0f, -1.0f}, colorFromKey(key),
+              {x0, y0, zPlane}, {x1, y0, zPlane}, {x1, y1, zPlane}, {x0, y1, zPlane},
+              static_cast<float>(w * lodStep), static_cast<float>(h * lodStep));
+    });
+  }
+
+  size_t totalVerts = 0;
+  size_t totalIndices = 0;
+  for (const auto& batch : tempBatches) {
+    totalVerts += batch.vertices.size();
+    totalIndices += batch.indices.size();
+  }
+  chunk.vertices.reserve(totalVerts);
+  chunk.indices.reserve(totalIndices);
+
+  for (auto& batch : tempBatches) {
+    if (batch.vertices.empty() || batch.indices.empty()) {
+      continue;
+    }
+    MeshBatch out = {};
+    out.textureId = batch.textureId;
+    out.indexOffset = static_cast<int>(chunk.indices.size());
+    out.indexCount = static_cast<int>(batch.indices.size());
+    chunk.batches.push_back(out);
+
+    uint32_t baseVertex = static_cast<uint32_t>(chunk.vertices.size());
+    chunk.vertices.insert(chunk.vertices.end(), batch.vertices.begin(), batch.vertices.end());
+    for (uint32_t index : batch.indices) {
+      chunk.indices.push_back(baseVertex + index);
+    }
+  }
+
+  chunk.meshDirty = true;
+  chunk.lodStep = lodStep;
+}
+
+void buildChunkMeshWorld(const World& world, const TextureAssets& textures, Chunk& chunk, int lodStep) {
+  const Chunk* chunkXPos = findChunkInternal(world, chunk.cx + 1, chunk.cy, chunk.cz);
+  const Chunk* chunkXNeg = findChunkInternal(world, chunk.cx - 1, chunk.cy, chunk.cz);
+  const Chunk* chunkYPos = (chunk.cy + 1 < kChunksY) ? findChunkInternal(world, chunk.cx, chunk.cy + 1, chunk.cz) : nullptr;
+  const Chunk* chunkYNeg = (chunk.cy - 1 >= 0) ? findChunkInternal(world, chunk.cx, chunk.cy - 1, chunk.cz) : nullptr;
+  const Chunk* chunkZPos = findChunkInternal(world, chunk.cx, chunk.cy, chunk.cz + 1);
+  const Chunk* chunkZNeg = findChunkInternal(world, chunk.cx, chunk.cy, chunk.cz - 1);
+
+  buildChunkMesh(textures, chunk, lodStep, world.seed,
+                 chunkXPos, chunkXNeg, chunkYPos, chunkYNeg, chunkZPos, chunkZNeg);
+}
+
+struct MeshBuildInput {
+  ChunkCoord coord;
+  int lodStep;
+  uint32_t seed;
+  TextureAssets textures;
+  Chunk chunk;
+  bool hasXPos;
+  bool hasXNeg;
+  bool hasYPos;
+  bool hasYNeg;
+  bool hasZPos;
+  bool hasZNeg;
+  Chunk xPos;
+  Chunk xNeg;
+  Chunk yPos;
+  Chunk yNeg;
+  Chunk zPos;
+  Chunk zNeg;
+};
+
+Chunk makeChunkCopy(const Chunk& source) {
+  Chunk copy = {};
+  copy.cx = source.cx;
+  copy.cy = source.cy;
+  copy.cz = source.cz;
+  copy.blocks = source.blocks;
+  copy.light = source.light;
+  copy.lodStep = source.lodStep;
+  return copy;
+}
+
+void copyNeighbor(const Chunk* source, bool& hasNeighbor, Chunk& dest) {
+  if (!source || source->blocks.empty()) {
+    hasNeighbor = false;
+    dest.blocks.clear();
+    dest.light.clear();
+    return;
+  }
+  hasNeighbor = true;
+  dest = makeChunkCopy(*source);
+}
+
+MeshBuildResult buildChunkMeshAsync(MeshBuildInput input) {
+  Chunk temp = std::move(input.chunk);
+  temp.vertices.clear();
+  temp.indices.clear();
+  temp.batches.clear();
+
+  const Chunk* xPos = input.hasXPos ? &input.xPos : nullptr;
+  const Chunk* xNeg = input.hasXNeg ? &input.xNeg : nullptr;
+  const Chunk* yPos = input.hasYPos ? &input.yPos : nullptr;
+  const Chunk* yNeg = input.hasYNeg ? &input.yNeg : nullptr;
+  const Chunk* zPos = input.hasZPos ? &input.zPos : nullptr;
+  const Chunk* zNeg = input.hasZNeg ? &input.zNeg : nullptr;
+
+  buildChunkMesh(input.textures, temp, input.lodStep, input.seed,
+                 xPos, xNeg, yPos, yNeg, zPos, zNeg);
+
+  MeshBuildResult result = {};
+  result.coord = input.coord;
+  result.lodStep = temp.lodStep;
+  result.vertices = std::move(temp.vertices);
+  result.indices = std::move(temp.indices);
+  result.batches = std::move(temp.batches);
+  return result;
+}
+
+void enqueueMeshBuild(World& world, const TextureAssets& textures, const Chunk& chunk, int lodStep) {
+  ChunkCoord coord = chunkCoord(chunk.cx, chunk.cy, chunk.cz);
+  if (world.queuedMeshes.find(coord) != world.queuedMeshes.end()) {
+    return;
+  }
+
+  MeshBuildInput input = {};
+  input.coord = coord;
+  input.lodStep = lodStep;
+  input.seed = world.seed;
+  input.textures = textures;
+  input.chunk = makeChunkCopy(chunk);
+
+  copyNeighbor(findChunkInternal(world, chunk.cx + 1, chunk.cy, chunk.cz), input.hasXPos, input.xPos);
+  copyNeighbor(findChunkInternal(world, chunk.cx - 1, chunk.cy, chunk.cz), input.hasXNeg, input.xNeg);
+  copyNeighbor((chunk.cy + 1 < kChunksY) ? findChunkInternal(world, chunk.cx, chunk.cy + 1, chunk.cz) : nullptr,
+               input.hasYPos, input.yPos);
+  copyNeighbor((chunk.cy - 1 >= 0) ? findChunkInternal(world, chunk.cx, chunk.cy - 1, chunk.cz) : nullptr,
+               input.hasYNeg, input.yNeg);
+  copyNeighbor(findChunkInternal(world, chunk.cx, chunk.cy, chunk.cz + 1), input.hasZPos, input.zPos);
+  copyNeighbor(findChunkInternal(world, chunk.cx, chunk.cy, chunk.cz - 1), input.hasZNeg, input.zNeg);
+
+  world.queuedMeshes.insert(coord);
+  world.meshTasks.push_back({coord, std::async(std::launch::async, buildChunkMeshAsync, std::move(input))});
+}
+
+bool chunkInView(const ChunkCoord& coord, Vec3 cameraPos, Vec3 cameraFront,
+                 Vec3 cameraUp, Vec3 cameraRight, float tanHalfFovX, float tanHalfFovY) {
+  float centerX = static_cast<float>(coord.cx * kChunkSize) * kBlockSize + kChunkHalfSize;
+  float centerY = static_cast<float>(coord.cy * kChunkSize) * kBlockSize + kChunkHalfSize;
+  float centerZ = static_cast<float>(coord.cz * kChunkSize) * kBlockSize + kChunkHalfSize;
+  Vec3 toCenter = {centerX - cameraPos.x, centerY - cameraPos.y, centerZ - cameraPos.z};
+  float distSq = dot(toCenter, toCenter);
+  if (distSq <= kChunkRadius * kChunkRadius) {
+    return true;
+  }
+
+  float forward = dot(toCenter, cameraFront);
+  if (forward <= 0.0f) {
+    return false;
+  }
+
+  float right = dot(toCenter, cameraRight);
+  float up = dot(toCenter, cameraUp);
+
+  float maxRight = forward * tanHalfFovX + kChunkRadius;
+  float maxUp = forward * tanHalfFovY + kChunkRadius;
+  if (std::fabs(right) > maxRight) {
+    return false;
+  }
+  if (std::fabs(up) > maxUp) {
+    return false;
+  }
+  return true;
+}
+
+int lodStepForDistance(int distance) {
+  if (distance <= kLodDistanceMid) {
+    return 1;
+  }
+  if (distance <= kLodDistanceFar) {
+    return 2;
+  }
+  return 4;
 }
 
 int worldToBlock(float value) {
@@ -483,12 +1209,18 @@ void initWorld(World& world) {
   world.renderDistance = kDefaultRenderDistance;
   world.chunks.clear();
   world.queuedChunks.clear();
+  world.queuedMeshes.clear();
   world.buildTasks.clear();
+  world.meshTasks.clear();
   world.visibleChunks.clear();
   world.pendingChunks.clear();
 }
 
 const Chunk* findChunk(const World& world, int cx, int cy, int cz) {
+  return findChunkInternal(world, cx, cy, cz);
+}
+
+Chunk* findChunkMutable(World& world, int cx, int cy, int cz) {
   return findChunkInternal(world, cx, cy, cz);
 }
 
@@ -504,10 +1236,15 @@ Chunk& getOrCreateChunk(World& world, const TextureAssets& textures, int cx, int
   chunk.cx = cx;
   chunk.cy = cy;
   chunk.cz = cz;
+  chunk.vbo = 0;
+  chunk.ibo = 0;
+  chunk.meshDirty = false;
+  chunk.lodStep = 1;
   chunk.blocks.assign(kChunkVolume, static_cast<uint8_t>(BlockAir));
   generateChunk(chunk, world.seed);
-  buildChunkMesh(world, textures, chunk);
+  computeChunkLight(world, chunk);
   auto result = world.chunks.emplace(key, std::move(chunk));
+  enqueueMeshBuild(world, textures, result.first->second, result.first->second.lodStep);
   created = true;
   return result.first->second;
 }
@@ -517,24 +1254,56 @@ Chunk buildChunkData(const ChunkCoord& coord, uint32_t seed) {
   chunk.cx = coord.cx;
   chunk.cy = coord.cy;
   chunk.cz = coord.cz;
+  chunk.vbo = 0;
+  chunk.ibo = 0;
+  chunk.meshDirty = false;
+  chunk.lodStep = 1;
   chunk.blocks.assign(kChunkVolume, static_cast<uint8_t>(BlockAir));
   generateChunk(chunk, seed);
   return chunk;
 }
 
-bool isFutureReady(const std::future<Chunk>& future) {
+template <typename T>
+bool isFutureReady(const std::future<T>& future) {
   return future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
 }
 
-void updateWorldChunks(World& world, const TextureAssets& textures, Vec3 playerPosition) {
-  int meshBuilt = 0;
-  for (auto it = world.buildTasks.begin(); it != world.buildTasks.end(); ) {
+void updateWorldChunks(World& world, const TextureAssets& textures, Vec3 playerPosition,
+                       Vec3 cameraFront, Vec3 cameraUp, Vec3 cameraRight,
+                       float fovDegrees, float aspect) {
+  int wx = worldToBlock(playerPosition.x);
+  int wz = worldToBlock(playerPosition.z);
+  int wy = worldToBlock(playerPosition.y);
+  int pcx = floorDiv(wx, kChunkSize);
+  int pcy = floorDiv(wy, kChunkSize);
+  int pcz = floorDiv(wz, kChunkSize);
+
+  int meshApplied = 0;
+  for (auto it = world.meshTasks.begin(); it != world.meshTasks.end(); ) {
     if (!isFutureReady(it->future)) {
       ++it;
       continue;
     }
-    if (meshBuilt >= kMeshBuildPerFrame) {
+    if (meshApplied >= kMeshBuildPerFrame) {
       break;
+    }
+    MeshBuildResult result = it->future.get();
+    world.queuedMeshes.erase(result.coord);
+    Chunk* chunk = findChunkInternal(world, result.coord.cx, result.coord.cy, result.coord.cz);
+    if (chunk && chunk->lodStep == result.lodStep) {
+      chunk->vertices = std::move(result.vertices);
+      chunk->indices = std::move(result.indices);
+      chunk->batches = std::move(result.batches);
+      chunk->meshDirty = true;
+    }
+    it = world.meshTasks.erase(it);
+    meshApplied++;
+  }
+
+  for (auto it = world.buildTasks.begin(); it != world.buildTasks.end(); ) {
+    if (!isFutureReady(it->future)) {
+      ++it;
+      continue;
     }
     Chunk chunk = it->future.get();
     world.queuedChunks.erase(it->coord);
@@ -542,36 +1311,49 @@ void updateWorldChunks(World& world, const TextureAssets& textures, Vec3 playerP
     auto existing = world.chunks.find(key);
     if (existing == world.chunks.end()) {
       auto result = world.chunks.emplace(key, std::move(chunk));
-      buildChunkMesh(world, textures, result.first->second);
+      computeChunkLight(world, result.first->second);
+      int dist = std::abs(result.first->second.cx - pcx);
+      dist = std::max(dist, std::abs(result.first->second.cy - pcy));
+      dist = std::max(dist, std::abs(result.first->second.cz - pcz));
+      int lodStep = lodStepForDistance(dist);
+      enqueueMeshBuild(world, textures, result.first->second, lodStep);
       rebuildChunksAround(world, textures, result.first->second.cx * kChunkSize,
                           result.first->second.cy * kChunkSize,
                           result.first->second.cz * kChunkSize);
-      meshBuilt++;
     }
     it = world.buildTasks.erase(it);
   }
-
-  int wx = worldToBlock(playerPosition.x);
-  int wz = worldToBlock(playerPosition.z);
-  int wy = worldToBlock(playerPosition.y);
-  int pcx = floorDiv(wx, kChunkSize);
-  int pcy = floorDiv(wy, kChunkSize);
-  int pcz = floorDiv(wz, kChunkSize);
   int minCy = pcy - kVerticalRenderDistance;
   int maxCy = pcy + kVerticalRenderDistance;
   if (minCy < 0) minCy = 0;
   if (maxCy > kChunksY - 1) maxCy = kChunksY - 1;
 
+  int render = world.renderDistance;
+  int maxRadius = render + kFarLodRing;
+
   world.visibleChunks.clear();
   world.pendingChunks.clear();
-  int render = world.renderDistance;
-  for (int radius = 0; radius <= render; ++radius) {
+  int maxChunks = (maxRadius * 2 + 1) * (maxRadius * 2 + 1) * (maxCy - minCy + 1);
+  if (maxChunks < 0) {
+    maxChunks = 0;
+  }
+  world.visibleChunks.reserve(static_cast<size_t>(maxChunks));
+  world.pendingChunks.reserve(static_cast<size_t>(maxChunks));
+
+  float tanHalfFovY = 0.0f;
+  float tanHalfFovX = 0.0f;
+  bool useFrustum = aspect > 0.0f && fovDegrees > 1.0f;
+  if (useFrustum) {
+    tanHalfFovY = std::tan(radians(fovDegrees) * 0.5f);
+    tanHalfFovX = tanHalfFovY * aspect;
+  }
+  for (int radius = 0; radius <= maxRadius; ++radius) {
     for (int dz = -radius; dz <= radius; ++dz) {
       for (int dx = -radius; dx <= radius; ++dx) {
         if (std::abs(dx) != radius && std::abs(dz) != radius) {
           continue;
         }
-        if (dx * dx + dz * dz > render * render) {
+        if (dx * dx + dz * dz > maxRadius * maxRadius) {
           continue;
         }
         int cx = pcx + dx;
@@ -579,12 +1361,36 @@ void updateWorldChunks(World& world, const TextureAssets& textures, Vec3 playerP
         for (int cy = minCy; cy <= maxCy; ++cy) {
           const Chunk* chunk = findChunkInternal(world, cx, cy, cz);
           if (chunk) {
-            world.visibleChunks.push_back(chunkCoord(chunk->cx, chunk->cy, chunk->cz));
+            ChunkCoord coord = chunkCoord(chunk->cx, chunk->cy, chunk->cz);
+            if (!useFrustum || chunkInView(coord, playerPosition, cameraFront, cameraUp, cameraRight,
+                                           tanHalfFovX, tanHalfFovY)) {
+              world.visibleChunks.push_back(coord);
+            }
           } else {
             world.pendingChunks.push_back(chunkCoord(cx, cy, cz));
           }
         }
       }
+    }
+  }
+
+  int meshScheduled = 0;
+  for (const ChunkCoord& coord : world.visibleChunks) {
+    if (meshScheduled >= kMeshBuildPerFrame) {
+      break;
+    }
+    Chunk* chunk = findChunkInternal(world, coord.cx, coord.cy, coord.cz);
+    if (!chunk) {
+      continue;
+    }
+    int dist = std::abs(coord.cx - pcx);
+    dist = std::max(dist, std::abs(coord.cy - pcy));
+    dist = std::max(dist, std::abs(coord.cz - pcz));
+    int lodStep = lodStepForDistance(dist);
+    if (chunk->lodStep != lodStep) {
+      chunk->lodStep = lodStep;
+      enqueueMeshBuild(world, textures, *chunk, lodStep);
+      meshScheduled++;
     }
   }
 
@@ -617,7 +1423,10 @@ void updateWorldChunks(World& world, const TextureAssets& textures, Vec3 playerP
 
 void rebuildWorldMeshes(World& world, const TextureAssets& textures) {
   for (auto& entry : world.chunks) {
-    buildChunkMesh(world, textures, entry.second);
+    computeChunkLight(world, entry.second);
+    int lodStep = entry.second.lodStep > 0 ? entry.second.lodStep : 1;
+    entry.second.lodStep = lodStep;
+    enqueueMeshBuild(world, textures, entry.second, lodStep);
   }
 }
 
@@ -695,7 +1504,10 @@ void rebuildChunksAround(World& world, const TextureAssets& textures, int wx, in
     if (!chunk) {
       continue;
     }
-    buildChunkMesh(world, textures, *chunk);
+    computeChunkLight(world, *chunk);
+    int lodStep = chunk->lodStep > 0 ? chunk->lodStep : 1;
+    chunk->lodStep = lodStep;
+    enqueueMeshBuild(world, textures, *chunk, lodStep);
   }
 }
 

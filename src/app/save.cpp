@@ -170,8 +170,16 @@ bool loadGame(const char* path, World& world, Player& player, Inventory& invento
 
   world.seed = seed;
   world.renderDistance = renderDistance;
+  if (world.renderDistance < 12) {
+    world.renderDistance = 12;
+  }
   world.chunks.clear();
   world.visibleChunks.clear();
+  world.pendingChunks.clear();
+  world.queuedChunks.clear();
+  world.queuedMeshes.clear();
+  world.buildTasks.clear();
+  world.meshTasks.clear();
 
   for (uint32_t i = 0; i < chunkCount; ++i) {
     int32_t cx = 0;
@@ -197,6 +205,10 @@ bool loadGame(const char* path, World& world, Player& player, Inventory& invento
     chunk.cx = cx;
     chunk.cy = cy;
     chunk.cz = cz;
+    chunk.vbo = 0;
+    chunk.ibo = 0;
+    chunk.meshDirty = false;
+    chunk.lodStep = 1;
     chunk.blocks.assign(kChunkVolume, 0u);
     in.read(reinterpret_cast<char*>(chunk.blocks.data()), chunk.blocks.size());
     if (!in) {

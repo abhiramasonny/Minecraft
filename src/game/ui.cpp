@@ -687,6 +687,7 @@ void drawUi(const Inventory& inventory, const TextureAssets& textures, const UiS
   glLoadIdentity();
 
   glDisable(GL_DEPTH_TEST);
+  glDisable(GL_LIGHTING);
   glEnable(GL_BLEND);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   glDisable(GL_TEXTURE_2D);
@@ -847,6 +848,7 @@ void drawUi(const Inventory& inventory, const TextureAssets& textures, const UiS
 
   glEnable(GL_TEXTURE_2D);
   glDisable(GL_BLEND);
+  glEnable(GL_LIGHTING);
   glEnable(GL_DEPTH_TEST);
 
   glMatrixMode(GL_MODELVIEW);
