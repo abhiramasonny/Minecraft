@@ -80,4 +80,6 @@ void loadTextures(TextureAssets& textures) {
   textures.furnaceSide = loadTexture("textures/blocks/furnace_side.png", 120, 120, 120);
   textures.furnaceFront = loadTexture("textures/blocks/furnace_front_off.png", 120, 120, 120);
   textures.stick = loadTexture("textures/items/stick.png", 150, 120, 70);
+  textures.water = loadTexture("textures/blocks/water_still.png", 80, 120, 180);
+  textures.torch = loadTexture("textures/blocks/torch_on.png", 240, 210, 120);
 }

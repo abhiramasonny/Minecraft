@@ -62,6 +62,7 @@ static const BlockType kPaletteBlocks[] = {
   BlockCraftingTable,
   BlockGlass,
   BlockFurnace,
+  BlockTorch,
   BlockStick,
 };
 static constexpr int kPaletteCount = static_cast<int>(sizeof(kPaletteBlocks) / sizeof(kPaletteBlocks[0]));
@@ -188,6 +189,8 @@ unsigned int textureForBlock(BlockType type, const TextureAssets& textures) {
       return textures.planks.id;
     case BlockCraftingTable:
       return textures.craftingTop.id;
+    case BlockTorch:
+      return textures.torch.id;
     default:
       return 0u;
   }

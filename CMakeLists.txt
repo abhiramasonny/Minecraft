@@ -29,6 +29,7 @@ add_executable(renderer
   src/game/world.cpp
   src/game/inventory.cpp
   src/game/ui.cpp
+  src/game/entity.cpp
   src/render/textures.cpp
   src/render/renderer.cpp
   src/third_party/stb_image.cpp

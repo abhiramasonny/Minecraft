@@ -12,6 +12,6 @@ void initRenderer();
 void shutdownRenderer();
 void setWorldLight(const WorldLight& light);
 void uploadVisibleChunkMeshes(World& world);
-void drawWorld(const World& world);
+void drawWorld(const World& world, double timeNow);
 void drawBlockOutline(int wx, int wy, int wz);
 void drawChunkBounds(const World& world);

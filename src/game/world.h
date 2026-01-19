@@ -28,6 +28,8 @@ enum BlockType : uint8_t {
   BlockGlass = 14,
   BlockFurnace = 15,
   BlockStick = 16,
+  BlockWater = 17,
+  BlockTorch = 18,
 };
 
 struct Vertex {
@@ -48,6 +50,8 @@ struct MeshBatch {
   unsigned int textureId;
   int indexOffset;
   int indexCount;
+  bool transparent;
+  bool animated;
 };
 
 struct Chunk {
@@ -63,6 +67,13 @@ struct Chunk {
   unsigned int ibo;
   bool meshDirty;
   int lodStep;
+  int maxHeight;
+  uint8_t faceOpenMask;
+  uint64_t contentHash;
+  uint64_t lastMeshHash;
+  bool isEmpty;
+  bool isSolid;
+  double lastAccessTime;
 };
 
 struct ChunkCoord {
@@ -114,12 +125,16 @@ struct World {
   std::vector<MeshBuildTask> meshTasks;
   std::vector<ChunkCoord> visibleChunks;
   std::vector<ChunkCoord> pendingChunks;
+  bool enableOcclusionCulling;
+  std::unordered_map<int64_t, int> heightmapCache;
+  size_t loadedChunkCount;
+  size_t maxLoadedChunks;
 };
 
 void initWorld(World& world);
 void updateWorldChunks(World& world, const TextureAssets& textures, Vec3 playerPosition,
                        Vec3 cameraFront, Vec3 cameraUp, Vec3 cameraRight,
-                       float fovDegrees, float aspect);
+                       float fovDegrees, float aspect, double timeNow);
 void rebuildWorldMeshes(World& world, const TextureAssets& textures);
 float groundHeightAt(const World& world, float x, float y, float z, bool& valid);
 BlockType blockAt(const World& world, int wx, int wy, int wz);

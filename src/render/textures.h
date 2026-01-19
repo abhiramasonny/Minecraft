@@ -31,6 +31,8 @@ struct TextureAssets {
   Texture furnaceSide;
   Texture furnaceFront;
   Texture stick;
+  Texture water;
+  Texture torch;
 };
 
 void loadTextures(TextureAssets& textures);

@@ -4,6 +4,7 @@
 #include "core/perlin.h"
 #include "render/textures.h"
 
+#include <GLFW/glfw3.h>
 #include <cmath>
 #include <cstdint>
 #include <future>
@@ -31,16 +32,30 @@ constexpr int kWorldY = kChunkSize * kChunksY;
 constexpr float kBlockSize = 1.0f;
 constexpr float kChunkHalfSize = kChunkSize * 0.5f * kBlockSize;
 constexpr float kChunkRadius = kChunkHalfSize * 1.7320508f;
-constexpr int kDefaultRenderDistance = 6;
-constexpr int kVerticalRenderDistance = 3;
-constexpr int kChunkBuildPerFrame = 1;
-constexpr int kMeshBuildPerFrame = 2;
+constexpr int kDefaultRenderDistance = 16;
+constexpr int kVerticalRenderDistance = 8;
+constexpr int kChunkBuildPerFrame = 2;
+constexpr int kMeshBuildPerFrame = 4;
 constexpr int kMaxLightLevel = 15;
-constexpr int kLodDistanceMid = 3;
-constexpr int kLodDistanceFar = 6;
-constexpr int kFarLodRing = 2;
+constexpr int kLodDistanceMid = 6;
+constexpr int kLodDistanceFar = 12;
+constexpr int kFarLodRing = 5;
+constexpr float kLakeChance = 0.035f;
 
 static_assert(sizeof(Vertex) == 16, "Packed vertex size mismatch.");
+
+uint64_t splitmix64(uint64_t x) {
+  x += 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  return x ^ (x >> 31);
+}
+
+uint64_t blockHashContribution(uint32_t index, uint8_t value) {
+  uint64_t x = (static_cast<uint64_t>(index) + 1ULL) * 0x9e3779b97f4a7c15ULL;
+  x ^= static_cast<uint64_t>(value) * 0xbf58476d1ce4e5b9ULL;
+  return splitmix64(x);
+}
 
 int blockIndex(int x, int y, int z) {
   return x + kChunkSize * (y + kChunkSize * z);
@@ -111,7 +126,128 @@ int floorMod(int value, int divisor) {
 }
 
 bool isLightBlocking(BlockType type) {
-  return type != BlockAir && type != BlockStick;
+  return type != BlockAir && type != BlockStick && type != BlockWater && type != BlockTorch;
+}
+
+bool isOccludingBlock(BlockType type) {
+  return type != BlockAir && type != BlockStick && type != BlockWater && type != BlockTorch;
+}
+
+bool isTransparentBlock(BlockType type) {
+  return type == BlockWater || type == BlockTorch;
+}
+
+constexpr uint8_t kFaceXPos = 1u << 0;
+constexpr uint8_t kFaceXNeg = 1u << 1;
+constexpr uint8_t kFaceYPos = 1u << 2;
+constexpr uint8_t kFaceYNeg = 1u << 3;
+constexpr uint8_t kFaceZPos = 1u << 4;
+constexpr uint8_t kFaceZNeg = 1u << 5;
+
+uint8_t computeFaceOpenMask(const Chunk& chunk) {
+  if (chunk.blocks.empty()) {
+    return 0u;
+  }
+  uint8_t mask = 0u;
+  //X+
+  for (int ly = 0; ly < kChunkSize && !(mask & kFaceXPos); ++ly) {
+    for (int lz = 0; lz < kChunkSize; ++lz) {
+      if (!isLightBlocking(blockAtLocal(chunk, kChunkSize - 1, ly, lz))) {
+        mask |= kFaceXPos;
+        break;
+      }
+    }
+  }
+  //X-
+  for (int ly = 0; ly < kChunkSize && !(mask & kFaceXNeg); ++ly) {
+    for (int lz = 0; lz < kChunkSize; ++lz) {
+      if (!isLightBlocking(blockAtLocal(chunk, 0, ly, lz))) {
+        mask |= kFaceXNeg;
+        break;
+      }
+    }
+  }
+  //Z+
+  for (int ly = 0; ly < kChunkSize && !(mask & kFaceZPos); ++ly) {
+    for (int lx = 0; lx < kChunkSize; ++lx) {
+      if (!isLightBlocking(blockAtLocal(chunk, lx, ly, kChunkSize - 1))) {
+        mask |= kFaceZPos;
+        break;
+      }
+    }
+  }
+  //Z-
+  for (int ly = 0; ly < kChunkSize && !(mask & kFaceZNeg); ++ly) {
+    for (int lx = 0; lx < kChunkSize; ++lx) {
+      if (!isLightBlocking(blockAtLocal(chunk, lx, ly, 0))) {
+        mask |= kFaceZNeg;
+        break;
+      }
+    }
+  }
+  //Y+
+  for (int lz = 0; lz < kChunkSize && !(mask & kFaceYPos); ++lz) {
+    for (int lx = 0; lx < kChunkSize; ++lx) {
+      if (!isLightBlocking(blockAtLocal(chunk, lx, kChunkSize - 1, lz))) {
+        mask |= kFaceYPos;
+        break;
+      }
+    }
+  }
+  // Y-
+  for (int lz = 0; lz < kChunkSize && !(mask & kFaceYNeg); ++lz) {
+    for (int lx = 0; lx < kChunkSize; ++lx) {
+      if (!isLightBlocking(blockAtLocal(chunk, lx, 0, lz))) {
+        mask |= kFaceYNeg;
+        break;
+      }
+    }
+  }
+  return mask;
+}
+
+void recomputeChunkMetadata(Chunk& chunk) {
+  uint64_t hash = 0;
+  int airCount = 0;
+  int solidCount = 0;
+  int maxHeight = 0;
+
+  for (int lx = 0; lx < kChunkSize; ++lx) {
+    for (int lz = 0; lz < kChunkSize; ++lz) {
+      for (int ly = kChunkSize - 1; ly >= 0; --ly) {
+        BlockType type = blockAtLocal(chunk, lx, ly, lz);
+        hash ^= blockHashContribution(static_cast<uint32_t>(blockIndex(lx, ly, lz)), static_cast<uint8_t>(type));
+        if (type == BlockAir) {
+          airCount++;
+        } else {
+          solidCount++;
+          int worldY = chunk.cy * kChunkSize + ly;
+          if (type != BlockWater && worldY > maxHeight) {
+            maxHeight = worldY;
+          }
+        }
+      }
+    }
+  }
+
+  chunk.contentHash = hash;
+  chunk.isEmpty = (airCount == kChunkVolume);
+  chunk.isSolid = (solidCount == kChunkVolume);
+  chunk.maxHeight = maxHeight;
+  chunk.faceOpenMask = computeFaceOpenMask(chunk);
+}
+
+bool isFaceOccluding(BlockType current, BlockType neighbor) {
+  if (neighbor == BlockAir || neighbor == BlockStick) {
+    return false;
+  }
+  if (neighbor == BlockWater) {
+    return current == BlockWater;
+  }
+  if (neighbor == BlockTorch) {
+    return current == BlockTorch;
+  }
+  return true;
 }
 
 ChunkCoord chunkCoord(int cx, int cy, int cz) {
@@ -219,6 +355,22 @@ void addQuad(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices, Vec3
   indices.push_back(base + 3u);
 }
 
+void addQuadSmooth(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices,
+                   Vec3 normal, Color baseColor[4],
+                   Vec3 a, Vec3 b, Vec3 c, Vec3 d, float uScale, float vScale) {
+  uint32_t base = static_cast<uint32_t>(vertices.size());
+  vertices.push_back(makeVertex(a, 0.0f, 0.0f, normal, baseColor[0]));
+  vertices.push_back(makeVertex(b, uScale, 0.0f, normal, baseColor[1]));
+  vertices.push_back(makeVertex(c, uScale, vScale, normal, baseColor[2]));
+  vertices.push_back(makeVertex(d, 0.0f, vScale, normal, baseColor[3]));
+  indices.push_back(base + 0u);
+  indices.push_back(base + 1u);
+  indices.push_back(base + 2u);
+  indices.push_back(base + 0u);
+  indices.push_back(base + 2u);
+  indices.push_back(base + 3u);
+}
+
 BlockTextures texturesFor(BlockType type, const TextureAssets& textures) {
   switch (type) {
     case BlockGrass:
@@ -254,6 +406,10 @@ BlockTextures texturesFor(BlockType type, const TextureAssets& textures) {
       return {textures.furnaceTop.id, textures.furnaceSide.id, textures.furnaceTop.id, textures.furnaceFront.id};
     case BlockStick:
       return {textures.stick.id, textures.stick.id, textures.stick.id, textures.stick.id};
+    case BlockWater:
+      return {textures.water.id, textures.water.id, textures.water.id, textures.water.id};
+    case BlockTorch:
+      return {textures.torch.id, textures.torch.id, textures.torch.id, textures.torch.id};
     default:
       return {0u, 0u, 0u, 0u};
   }
@@ -277,12 +433,15 @@ Color scaleColor(Color base, float factor) {
 }
 
 Vec3 biomeTintAt(int x, int z, uint32_t seed);
+void setBlockInChunk(Chunk& chunk, int wx, int wy, int wz, BlockType type);
 
 struct FaceKey {
   unsigned int textureId;
   uint8_t r;
   uint8_t g;
   uint8_t b;
+  bool transparent;
+  bool animated;
 };
 
 struct FaceCell {
@@ -291,7 +450,8 @@ struct FaceCell {
 };
 
 bool operator==(const FaceKey& a, const FaceKey& b) {
-  return a.textureId == b.textureId && a.r == b.r && a.g == b.g && a.b == b.b;
+  return a.textureId == b.textureId && a.r == b.r && a.g == b.g && a.b == b.b
+    && a.transparent == b.transparent && a.animated == b.animated;
 }
 
 uint8_t colorToByte(float value) {
@@ -358,11 +518,54 @@ FaceKey faceKeyFor(BlockType type, FaceDir face, int wx, int wz, uint32_t seed, 
       break;
   }
 
-  float ambientMin = 0.3f;
+  float ambientMin = 0.12f;
   float invMax = 1.0f / static_cast<float>(kMaxLightLevel);
   float lightFactor = ambientMin + (1.0f - ambientMin) * (static_cast<float>(light) * invMax);
   Color lit = scaleColor(faceColor, lightFactor);
-  return {textureId, colorToByte(lit.r), colorToByte(lit.g), colorToByte(lit.b)};
+  return {textureId, colorToByte(lit.r), colorToByte(lit.g), colorToByte(lit.b),
+          isTransparentBlock(type), type == BlockWater};
+}
+
+float smoothLightAO(const Chunk& chunk, int lx, int ly, int lz,
+                    const Chunk* neighbors[6],
+                    int dx, int dy, int dz, uint8_t& avgLight) {
+  const Chunk* chunkXPos = neighbors[0];
+  const Chunk* chunkXNeg = neighbors[1];
+  const Chunk* chunkYPos = neighbors[2];
+  const Chunk* chunkYNeg = neighbors[3];
+  const Chunk* chunkZPos = neighbors[4];
+  const Chunk* chunkZNeg = neighbors[5];
+  
+  uint8_t s[3];
+  bool solid[3];
+  
+  const Chunk* nx = (dx > 0) ? chunkXPos : (dx < 0) ? chunkXNeg : nullptr;
+  const Chunk* ny = (dy > 0) ? chunkYPos : (dy < 0) ? chunkYNeg : nullptr;
+  const Chunk* nz = (dz > 0) ? chunkZPos : (dz < 0) ? chunkZNeg : nullptr;
+  
+  s[0] = lightAtNeighbor(chunk, nx, lx, ly, lz, dx, 0, 0);
+  s[1] = lightAtNeighbor(chunk, ny, lx, ly, lz, 0, dy, 0);
+  s[2] = lightAtNeighbor(chunk, nz, lx, ly, lz, 0, 0, dz);
+  
+  solid[0] = isOccludingBlock(blockAtNeighbor(chunk, nx, lx, ly, lz, dx, 0, 0));
+  solid[1] = isOccludingBlock(blockAtNeighbor(chunk, ny, lx, ly, lz, 0, dy, 0));
+  solid[2] = isOccludingBlock(blockAtNeighbor(chunk, nz, lx, ly, lz, 0, 0, dz));
+  
+  int solidCount = (solid[0] ? 1 : 0) + (solid[1] ? 1 : 0) + (solid[2] ? 1 : 0);
+  
+  float ao = 1.0f - (static_cast<float>(solidCount) * 0.2f);
+  
+  int lightSum = 0;
+  int lightCount = 0;
+  for (int i = 0; i < 3; ++i) {
+    if (!solid[i]) {
+      lightSum += s[i];
+      lightCount++;
+    }
+  }
+  
+  avgLight = lightCount > 0 ? static_cast<uint8_t>(lightSum / lightCount) : 0;
+  return ao;
 }
 
 BlockType sampleBlockRegion(const Chunk& chunk, int lx, int ly, int lz, int step) {
@@ -382,11 +585,12 @@ BlockType sampleBlockRegion(const Chunk& chunk, int lx, int ly, int lz, int step
   return BlockAir;
 }
 
-bool regionIsFullySolid(const Chunk& chunk, int lx, int ly, int lz, int step) {
+bool regionIsFullySolid(const Chunk& chunk, int lx, int ly, int lz, int step, BlockType current) {
   for (int y = 0; y < step; ++y) {
     for (int z = 0; z < step; ++z) {
       for (int x = 0; x < step; ++x) {
-        if (blockAtLocal(chunk, lx + x, ly + y, lz + z) == BlockAir) {
+        BlockType neighbor = blockAtLocal(chunk, lx + x, ly + y, lz + z);
+        if (!isFaceOccluding(current, neighbor)) {
           return false;
         }
       }
@@ -396,14 +600,14 @@ bool regionIsFullySolid(const Chunk& chunk, int lx, int ly, int lz, int step) {
 }
 
 bool neighborRegionIsFullySolid(const Chunk& chunk, const Chunk* neighbor,
-                                int lx, int ly, int lz, int step, int dx, int dy, int dz) {
+                                int lx, int ly, int lz, int step, int dx, int dy, int dz, BlockType current) {
   int nx = lx + dx * step;
   int ny = ly + dy * step;
   int nz = lz + dz * step;
   if (nx >= 0 && nx + step <= kChunkSize &&
       ny >= 0 && ny + step <= kChunkSize &&
       nz >= 0 && nz + step <= kChunkSize) {
-    return regionIsFullySolid(chunk, nx, ny, nz, step);
+    return regionIsFullySolid(chunk, nx, ny, nz, step, current);
   }
   if (!neighbor) {
     return false;
@@ -423,7 +627,7 @@ bool neighborRegionIsFullySolid(const Chunk& chunk, const Chunk* neighbor,
   } else if (nz + step > kChunkSize) {
     nz = 0;
   }
-  return regionIsFullySolid(*neighbor, nx, ny, nz, step);
+  return regionIsFullySolid(*neighbor, nx, ny, nz, step, current);
 }
 
 uint8_t lightAtMacroNeighbor(const Chunk& chunk, const Chunk* neighbor,
@@ -432,6 +636,98 @@ uint8_t lightAtMacroNeighbor(const Chunk& chunk, const Chunk* neighbor,
   int sy = ly + (dy > 0 ? step - 1 : 0);
   int sz = lz + (dz > 0 ? step - 1 : 0);
   return lightAtNeighbor(chunk, neighbor, sx, sy, sz, dx, dy, dz);
+}
+
+struct VertexLight {
+  uint8_t light;
+  float ao;
+};
+
+VertexLight smoothLightAtVertex(const Chunk& chunk, const Chunk* neighbors[6],
+                                 int lx, int ly, int lz,
+                                 int du, int dv, int dw,
+                                 int axis) {
+  const Chunk* chunkXPos = neighbors[0];
+  const Chunk* chunkXNeg = neighbors[1];
+  const Chunk* chunkYPos = neighbors[2];
+  const Chunk* chunkYNeg = neighbors[3];
+  const Chunk* chunkZPos = neighbors[4];
+  const Chunk* chunkZNeg = neighbors[5];
+  
+  uint8_t light[4];
+  bool solid[4];
+  
+  if (axis == 0) {
+    light[0] = lightAtNeighbor(chunk, dv > 0 ? chunkYPos : chunkYNeg, lx, ly, lz, 0, dv, dw);
+    light[1] = lightAtNeighbor(chunk, dw > 0 ? chunkZPos : chunkZNeg, lx, ly, lz, 0, 0, dw);
+    light[2] = lightAtNeighbor(chunk, dv > 0 ? chunkYPos : chunkYNeg, lx, ly, lz, 0, dv, 0);
+    light[3] = lightAtNeighbor(chunk, (dv > 0 && dw > 0) ? (chunkYPos ? chunkYPos : chunkZPos) : 
+                                      (dv < 0 && dw < 0) ? (chunkYNeg ? chunkYNeg : chunkZNeg) :
+                                      (dv > 0) ? chunkYPos : (dw > 0) ? chunkZPos : chunkZNeg,
+                              lx, ly, lz, 0, dv, dw);
+    
+    solid[0] = isOccludingBlock(blockAtNeighbor(chunk, dv > 0 ? chunkYPos : chunkYNeg, lx, ly, lz, 0, dv, dw));
+    solid[1] = isOccludingBlock(blockAtNeighbor(chunk, dw > 0 ? chunkZPos : chunkZNeg, lx, ly, lz, 0, 0, dw));
+    solid[2] = isOccludingBlock(blockAtNeighbor(chunk, dv > 0 ? chunkYPos : chunkYNeg, lx, ly, lz, 0, dv, 0));
+    solid[3] = isOccludingBlock(blockAtNeighbor(chunk, (dv > 0 && dw > 0) ? (chunkYPos ? chunkYPos : chunkZPos) :
+                                                        (dv < 0 && dw < 0) ? (chunkYNeg ? chunkYNeg : chunkZNeg) :
+                                                        (dv > 0) ? chunkYPos : (dw > 0) ? chunkZPos : chunkZNeg,
+                                               lx, ly, lz, 0, dv, dw));
+  } else if (axis == 1) {
+    light[0] = lightAtNeighbor(chunk, du > 0 ? chunkXPos : chunkXNeg, lx, ly, lz, du, 0, dw);
+    light[1] = lightAtNeighbor(chunk, dw > 0 ? chunkZPos : chunkZNeg, lx, ly, lz, 0, 0, dw);
+    light[2] = lightAtNeighbor(chunk, du > 0 ? chunkXPos : chunkXNeg, lx, ly, lz, du, 0, 0);
+    light[3] = lightAtNeighbor(chunk, (du > 0 && dw > 0) ? (chunkXPos ? chunkXPos : chunkZPos) :
+                                      (du < 0 && dw < 0) ? (chunkXNeg ? chunkXNeg : chunkZNeg) :
+                                      (du > 0) ? chunkXPos : (dw > 0) ? chunkZPos : chunkZNeg,
+                              lx, ly, lz, du, 0, dw);
+    
+    solid[0] = isOccludingBlock(blockAtNeighbor(chunk, du > 0 ? chunkXPos : chunkXNeg, lx, ly, lz, du, 0, dw));
+    solid[1] = isOccludingBlock(blockAtNeighbor(chunk, dw > 0 ? chunkZPos : chunkZNeg, lx, ly, lz, 0, 0, dw));
+    solid[2] = isOccludingBlock(blockAtNeighbor(chunk, du > 0 ? chunkXPos : chunkXNeg, lx, ly, lz, du, 0, 0));
+    solid[3] = isOccludingBlock(blockAtNeighbor(chunk, (du > 0 && dw > 0) ? (chunkXPos ? chunkXPos : chunkZPos) :
+                                                        (du < 0 && dw < 0) ? (chunkXNeg ? chunkXNeg : chunkZNeg) :
+                                                        (du > 0) ? chunkXPos : (dw > 0) ? chunkZPos : chunkZNeg,
+                                               lx, ly, lz, du, 0, dw));
+  } else {
+    light[0] = lightAtNeighbor(chunk, du > 0 ? chunkXPos : chunkXNeg, lx, ly, lz, du, dv, 0);
+    light[1] = lightAtNeighbor(chunk, dv > 0 ? chunkYPos : chunkYNeg, lx, ly, lz, 0, dv, 0);
+    light[2] = lightAtNeighbor(chunk, du > 0 ? chunkXPos : chunkXNeg, lx, ly, lz, du, 0, 0);
+    light[3] = lightAtNeighbor(chunk, (du > 0 && dv > 0) ? (chunkXPos ? chunkXPos : chunkYPos) :
+                                      (du < 0 && dv < 0) ? (chunkXNeg ? chunkXNeg : chunkYNeg) :
+                                      (du > 0) ? chunkXPos : (dv > 0) ? chunkYPos : chunkYNeg,
+                              lx, ly, lz, du, dv, 0);
+    
+    solid[0] = isOccludingBlock(blockAtNeighbor(chunk, du > 0 ? chunkXPos : chunkXNeg, lx, ly, lz, du, dv, 0));
+    solid[1] = isOccludingBlock(blockAtNeighbor(chunk, dv > 0 ? chunkYPos : chunkYNeg, lx, ly, lz, 0, dv, 0));
+    solid[2] = isOccludingBlock(blockAtNeighbor(chunk, du > 0 ? chunkXPos : chunkXNeg, lx, ly, lz, du, 0, 0));
+    solid[3] = isOccludingBlock(blockAtNeighbor(chunk, (du > 0 && dv > 0) ? (chunkXPos ? chunkXPos : chunkYPos) :
+                                                        (du < 0 && dv < 0) ? (chunkXNeg ? chunkXNeg : chunkYNeg) :
+                                                        (du > 0) ? chunkXPos : (dv > 0) ? chunkYPos : chunkYNeg,
+                                               lx, ly, lz, du, dv, 0));
+  }
+  
+  int aoValue;
+  if (solid[0] && solid[1]) {
+    aoValue = 0;
+  } else {
+    int solidCount = (solid[0] ? 1 : 0) + (solid[1] ? 1 : 0) + (solid[2] ? 1 : 0);
+    aoValue = 3 - solidCount;
+  }
+  float ao = aoValue / 3.0f;
+  
+  int lightSum = 0;
+  int lightCount = 0;
+  for (int i = 0; i < 4; ++i) {
+    if (!solid[i]) {
+      lightSum += light[i];
+      lightCount++;
+    }
+  }
+  
+  uint8_t avgLight = lightCount > 0 ? static_cast<uint8_t>(lightSum / lightCount) : 0;
+  
+  return {avgLight, ao};
 }
 
 template <typename EmitFunc>
@@ -566,18 +862,288 @@ Vec3 biomeTintAt(int x, int z, uint32_t seed) {
   return lerpVec3(dry, lush, biome);
 }
 
-bool shouldCarveCave(int x, int y, int z, int top, uint32_t seed) {
-  if (y <= 10 || y >= top - 24) {
+struct CaveSegment {
+  Vec3 start;
+  Vec3 end;
+  float radius;
+  bool entrance;
+};
+
+constexpr float kCaveChunkRate = 0.2f;
+
+float distanceSqToSegment(Vec3 p, Vec3 a, Vec3 b) {
+  Vec3 ab = b - a;
+  float abLenSq = dot(ab, ab);
+  if (abLenSq <= 0.0001f) {
+    Vec3 ap = p - a;
+    return dot(ap, ap);
+  }
+  float t = dot(p - a, ab) / abLenSq;
+  t = std::max(0.0f, std::min(1.0f, t));
+  Vec3 proj = a + ab * t;
+  Vec3 diff = p - proj;
+  return dot(diff, diff);
+}
+
+float caveRand(int cx, int cz, int salt, uint32_t seed) {
+  int hx = cx * 31 + salt * 101;
+  int hz = cz * 17 + salt * 57;
+  return hash01(hx, hz, seed + 0x9e3779b9u);
+}
+
+bool caveRootAt(int cx, int cz, uint32_t seed) {
+  return caveRand(cx, cz, 1, seed) < kCaveChunkRate;
+}
+
+Vec3 caveDirection(int cx, int cz, int salt, uint32_t seed, float verticalRange) {
+  float yaw = caveRand(cx, cz, salt, seed) * 6.2831853f;
+  float pitch = (caveRand(cx, cz, salt + 11, seed) - 0.5f) * verticalRange;
+  float cosPitch = std::cos(pitch);
+  return {std::cos(yaw) * cosPitch, std::sin(pitch), std::sin(yaw) * cosPitch};
+}
+
+void appendCaveSystemSegments(int cx, int cz, uint32_t seed, std::vector<CaveSegment>& segments) {
+  float offsetX = caveRand(cx, cz, 2, seed) * static_cast<float>(kChunkSize - 6) + 3.0f;
+  float offsetZ = caveRand(cx, cz, 3, seed) * static_cast<float>(kChunkSize - 6) + 3.0f;
+  int baseX = cx * kChunkSize + static_cast<int>(offsetX);
+  int baseZ = cz * kChunkSize + static_cast<int>(offsetZ);
+  float biome = 0.0f;
+  int top = static_cast<int>(terrainHeightAt(baseX, baseZ, seed, biome));
+  if (top < 4 || top >= kWorldY - 2) {
+    return;
+  }
+  bool hillside = caveRand(cx, cz, 4, seed) > 0.55f;
+  int lowestNeighbor = top;
+  int slopeDirX = 1;
+  int slopeDirZ = 0;
+  if (hillside) {
+    float tempBiome = 0.0f;
+    int hXPos = static_cast<int>(terrainHeightAt(baseX + 3, baseZ, seed, tempBiome));
+    int hXNeg = static_cast<int>(terrainHeightAt(baseX - 3, baseZ, seed, tempBiome));
+    int hZPos = static_cast<int>(terrainHeightAt(baseX, baseZ + 3, seed, tempBiome));
+    int hZNeg = static_cast<int>(terrainHeightAt(baseX, baseZ - 3, seed, tempBiome));
+    lowestNeighbor = hXPos;
+    slopeDirX = 1;
+    slopeDirZ = 0;
+    if (hXNeg < lowestNeighbor) {
+      lowestNeighbor = hXNeg;
+      slopeDirX = -1;
+      slopeDirZ = 0;
+    }
+    if (hZPos < lowestNeighbor) {
+      lowestNeighbor = hZPos;
+      slopeDirX = 0;
+      slopeDirZ = 1;
+    }
+    if (hZNeg < lowestNeighbor) {
+      lowestNeighbor = hZNeg;
+      slopeDirX = 0;
+      slopeDirZ = -1;
+    }
+  }
+  int inset = hillside ? (2 + static_cast<int>(caveRand(cx, cz, 5, seed) * 3.0f))
+                       : static_cast<int>(caveRand(cx, cz, 6, seed) * 2.0f);
+  int entranceY = top - inset;
+  if (hillside) {
+    entranceY = std::min(entranceY, lowestNeighbor + 1);
+  }
+  entranceY = std::max(2, std::min(kWorldY - 3, entranceY));
+  Vec3 entrance = {static_cast<float>(baseX) + 0.5f,
+                   static_cast<float>(entranceY) + 0.5f,
+                   static_cast<float>(baseZ) + 0.5f};
+  Vec3 entryDir = caveDirection(cx, cz, 7, seed, 0.8f);
+  entryDir.y = -std::abs(entryDir.y) - 0.2f;
+  entryDir = normalize(entryDir);
+  float entryDepth = 3.0f + caveRand(cx, cz, 8, seed) * 4.0f;
+  Vec3 entryPoint = entrance + entryDir * entryDepth;
+  float entranceRadius = 2.3f + caveRand(cx, cz, 9, seed) * 0.9f;
+  segments.push_back({entrance, entryPoint, entranceRadius, true});
+  if (hillside) {
+    Vec3 mouthDir = {static_cast<float>(slopeDirX), 0.0f, static_cast<float>(slopeDirZ)};
+    float mouthLength = 3.0f + caveRand(cx, cz, 12, seed) * 4.0f;
+    Vec3 mouthEnd = entrance + mouthDir * mouthLength;
+    segments.push_back({entrance, mouthEnd, entranceRadius, true});
+  }
+
+  std::vector<CaveSegment> spine;
+  spine.reserve(6);
+  Vec3 start = entryPoint;
+  int mainCount = 3 + static_cast<int>(caveRand(cx, cz, 10, seed) * 3.0f);
+  for (int i = 0; i < mainCount; ++i) {
+    Vec3 dir = caveDirection(cx, cz, 20 + i * 3, seed, 0.5f);
+    dir.y *= 0.6f;
+    float length = 20.0f + caveRand(cx, cz, 30 + i * 3, seed) * 50.0f;
+    float radius = 2.4f + caveRand(cx, cz, 31 + i * 3, seed) * 1.8f;
+    Vec3 end = start + dir * length;
+    CaveSegment segment = {start, end, radius, false};
+    segments.push_back(segment);
+    spine.push_back(segment);
+    start = end;
+  }
+
+  int branchCount = 1 + static_cast<int>(caveRand(cx, cz, 60, seed) * 3.0f);
+  for (int b = 0; b < branchCount; ++b) {
+    int pick = static_cast<int>(caveRand(cx, cz, 70 + b, seed) * static_cast<float>(spine.size()));
+    if (pick < 0) pick = 0;
+    if (pick >= static_cast<int>(spine.size())) pick = static_cast<int>(spine.size()) - 1;
+    Vec3 branchVec = spine[pick].end - spine[pick].start;
+    float t = 0.3f + caveRand(cx, cz, 80 + b, seed) * 0.4f;
+    Vec3 branchStart = spine[pick].start + branchVec * t;
+    int branchSegments = 1 + static_cast<int>(caveRand(cx, cz, 90 + b, seed) * 2.0f);
+    Vec3 branchCursor = branchStart;
+    for (int s = 0; s < branchSegments; ++s) {
+      Vec3 dir = caveDirection(cx, cz, 100 + b * 7 + s * 3, seed, 0.9f);
+      dir.y *= 0.6f;
+      float length = 12.0f + caveRand(cx, cz, 110 + b * 7 + s * 3, seed) * 28.0f;
+      float radius = 1.7f + caveRand(cx, cz, 120 + b * 7 + s * 3, seed) * 1.4f;
+      Vec3 end = branchCursor + dir * length;
+      segments.push_back({branchCursor, end, radius, false});
+      branchCursor = end;
+    }
+  }
+}
+
+void buildCaveSegmentsForChunk(const Chunk& chunk, uint32_t seed, std::vector<CaveSegment>& segments) {
+  int range = 3;
+  segments.reserve(48);
+  for (int cx = chunk.cx - range; cx <= chunk.cx + range; ++cx) {
+    for (int cz = chunk.cz - range; cz <= chunk.cz + range; ++cz) {
+      if (!caveRootAt(cx, cz, seed)) {
+        continue;
+      }
+      appendCaveSystemSegments(cx, cz, seed, segments);
+    }
+  }
+}
+
+bool shouldCarveCave(const std::vector<CaveSegment>& segments, int x, int y, int z, int top, uint32_t seed) {
+  if (segments.empty() || y <= 1 || y >= kWorldY - 1) {
     return false;
   }
-  if (hash01(x / 24, z / 24, seed) > 0.04f) {
+  if (y > top) {
     return false;
   }
-  float depth = 1.0f - static_cast<float>(y) / static_cast<float>(kWorldY - 1);
-  float caveNoise = fbmNoise3D(static_cast<float>(x) * 0.12f, static_cast<float>(y) * 0.12f,
-                               static_cast<float>(z) * 0.12f, 2, 2.8f, 0.38f, seed);
-  float threshold = 0.88f - depth * 0.03f;
-  return caveNoise > threshold && caveNoise < threshold + 0.02f;
+  Vec3 p = {static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, static_cast<float>(z) + 0.5f};
+  float noise = fbmNoise3D(static_cast<float>(x) * 0.17f, static_cast<float>(y) * 0.17f,
+                           static_cast<float>(z) * 0.17f, 2, 2.2f, 0.5f, seed + 3187u);
+  float radiusScale = 0.85f + noise * 0.3f;
+  for (const CaveSegment& segment : segments) {
+    if (!segment.entrance && y > top - 4) {
+      continue;
+    }
+    float radius = segment.radius * radiusScale;
+    float distSq = distanceSqToSegment(p, segment.start, segment.end);
+    if (distSq <= radius * radius) {
+      return true;
+    }
+  }
+  return false;
+}
+
+struct LakeParams {
+  bool enabled;
+  int centerX;
+  int centerZ;
+  int centerY;
+  float radius;
+  int maxDepth;
+  int seaLevel;
+};
+
+float lakeRand(int cx, int cz, int salt, uint32_t seed) {
+  int hx = cx * 29 + salt * 131;
+  int hz = cz * 43 + salt * 97;
+  return hash01(hx, hz, seed + 0x7f4a7c15u);
+}
+
+LakeParams lakeForChunk(int cx, int cz, uint32_t seed) {
+  LakeParams lake = {};
+  if (lakeRand(cx, cz, 1, seed) > kLakeChance) {
+    lake.enabled = false;
+    return lake;
+  }
+  float centerLX = 5.0f + lakeRand(cx, cz, 2, seed) * 5.0f;
+  float centerLZ = 5.0f + lakeRand(cx, cz, 3, seed) * 5.0f;
+  float radius = 3.5f + lakeRand(cx, cz, 4, seed) * 1.6f;
+  int maxDepth = 2 + static_cast<int>(lakeRand(cx, cz, 5, seed) * 3.0f);
+  lake.enabled = true;
+  lake.centerX = cx * kChunkSize + static_cast<int>(centerLX);
+  lake.centerZ = cz * kChunkSize + static_cast<int>(centerLZ);
+  lake.radius = radius;
+  lake.maxDepth = maxDepth;
+
+  float biome = 0.0f;
+  int centerTop = static_cast<int>(terrainHeightAt(lake.centerX, lake.centerZ, seed, biome));
+  lake.centerY = std::max(2, std::min(kWorldY - 3, centerTop));
+
+  int rimMin = kWorldY - 1;
+  constexpr int kRimSamples = 8;
+  for (int i = 0; i < kRimSamples; ++i) {
+    float angle = static_cast<float>(i) / static_cast<float>(kRimSamples) * 6.2831853f;
+    int rx = lake.centerX + static_cast<int>(std::cos(angle) * (lake.radius + 1.0f));
+    int rz = lake.centerZ + static_cast<int>(std::sin(angle) * (lake.radius + 1.0f));
+    float rimBiome = 0.0f;
+    int rimTop = static_cast<int>(terrainHeightAt(rx, rz, seed, rimBiome));
+    rimMin = std::min(rimMin, rimTop);
+  }
+  int seaLevel = std::min(rimMin - 1, lake.centerY - 1);
+  seaLevel = std::max(2, std::min(kWorldY - 3, seaLevel));
+  int minFloor = lake.centerY - lake.maxDepth;
+  if (seaLevel <= minFloor + 1) {
+    lake.enabled = false;
+    return lake;
+  }
+  lake.seaLevel = seaLevel;
+  return lake;
+}
+
+bool lakeContains(const LakeParams& lake, int wx, int wz, uint32_t seed) {
+  if (!lake.enabled) {
+    return false;
+  }
+  float dx = static_cast<float>(wx - lake.centerX);
+  float dz = static_cast<float>(wz - lake.centerZ);
+  float distSq = dx * dx + dz * dz;
+  float wobble = (hash01(wx, wz, seed + 9187u) - 0.5f) * 1.0f;
+  float radius = std::max(1.5f, lake.radius + wobble);
+  return distSq <= radius * radius;
+}
+
+void carveLakeInChunk(Chunk& chunk, const LakeParams& lake, uint32_t seed) {
+  if (!lake.enabled) {
+    return;
+  }
+  int baseX = chunk.cx * kChunkSize;
+  int baseZ = chunk.cz * kChunkSize;
+  for (int lx = 0; lx < kChunkSize; ++lx) {
+    int wx = baseX + lx;
+    for (int lz = 0; lz < kChunkSize; ++lz) {
+      int wz = baseZ + lz;
+      if (!lakeContains(lake, wx, wz, seed)) {
+        continue;
+      }
+      float dx = static_cast<float>(wx - lake.centerX);
+      float dz = static_cast<float>(wz - lake.centerZ);
+      float dist = std::sqrt(dx * dx + dz * dz);
+      float t = std::min(1.0f, dist / lake.radius);
+      float depthShape = 1.0f - (t * t);
+      int depthJitter = static_cast<int>(hash01(wx, wz, seed + 1223u) * 2.0f);
+      int floorY = lake.centerY - static_cast<int>(depthShape * static_cast<float>(lake.maxDepth)) - depthJitter;
+      floorY = std::max(1, floorY);
+      int topY = lake.seaLevel;
+      for (int wy = floorY; wy <= topY; ++wy) {
+        setBlockInChunk(chunk, wx, wy, wz, BlockWater);
+      }
+      float biome = 0.0f;
+      int top = static_cast<int>(terrainHeightAt(wx, wz, seed, biome));
+      if (top < 1) {
+        top = 1;
+      }
+      for (int wy = lake.seaLevel + 1; wy <= top; ++wy) {
+        setBlockInChunk(chunk, wx, wy, wz, BlockAir);
+      }
+    }
+  }
 }
 
 bool blockInsideChunk(const Chunk& chunk, int wx, int wy, int wz) {
@@ -636,8 +1202,8 @@ bool shouldPlaceTree(int x, int z, int top, float biome, uint32_t seed) {
   float forestNoise = fbmPerlin(static_cast<float>(x) * 0.006f, static_cast<float>(z) * 0.006f, 3, 2.0f, 0.5f);
   float localNoise = fbmPerlin(static_cast<float>(x) * 0.035f, static_cast<float>(z) * 0.035f, 2, 2.0f, 0.5f);
   float scatter = hash01(x, z, seed);
-  bool forest = forestNoise > 0.58f && localNoise > 0.4f && scatter > 0.3f;
-  bool lone = forestNoise > 0.45f && localNoise > 0.6f && scatter > 0.82f;
+  bool forest = forestNoise > 0.66f && localNoise > 0.55f && scatter > 0.45f;
+  bool lone = forestNoise > 0.5f && localNoise > 0.7f && scatter > 0.88f;
   return top > 4 && top < kWorldY - 6 && biome > 0.25f && (forest || lone);
 }
 
@@ -649,11 +1215,54 @@ int treeHeightAt(int x, int z, uint32_t seed, bool dense) {
   return height;
 }
 
+float treeScoreAt(int x, int z, uint32_t seed) {
+  return hash01(x, z, seed + 9127u);
+}
+
+bool isTreeSpacingClear(int x, int z, int top, float biome, uint32_t seed) {
+  constexpr int kTreeSpacing = 6;
+  float score = treeScoreAt(x, z, seed);
+  int radiusSq = kTreeSpacing * kTreeSpacing;
+  for (int dz = -kTreeSpacing; dz <= kTreeSpacing; ++dz) {
+    for (int dx = -kTreeSpacing; dx <= kTreeSpacing; ++dx) {
+      if (dx == 0 && dz == 0) {
+        continue;
+      }
+      if (dx * dx + dz * dz > radiusSq) {
+        continue;
+      }
+      int nx = x + dx;
+      int nz = z + dz;
+      float neighborScore = treeScoreAt(nx, nz, seed);
+      if (neighborScore < score - 1e-5f) {
+        continue;
+      }
+      float neighborBiome = 0.0f;
+      int neighborTop = static_cast<int>(terrainHeightAt(nx, nz, seed, neighborBiome));
+      if (!shouldPlaceTree(nx, nz, neighborTop, neighborBiome, seed)) {
+        continue;
+      }
+      if (neighborScore > score + 1e-5f) {
+        return false;
+      }
+      if (neighborScore >= score && (dx < 0 || (dx == 0 && dz < 0))) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+void removeInteriorBlocks(Chunk& chunk);
+
 void generateChunk(Chunk& chunk, uint32_t seed) {
   chunk.blocks.assign(kChunkVolume, static_cast<uint8_t>(BlockAir));
   int baseX = chunk.cx * kChunkSize;
   int baseY = chunk.cy * kChunkSize;
   int baseZ = chunk.cz * kChunkSize;
+  std::vector<CaveSegment> caveSegments;
+  buildCaveSegmentsForChunk(chunk, seed, caveSegments);
+  LakeParams lake = lakeForChunk(chunk.cx, chunk.cz, seed);
 
   for (int lx = 0; lx < kChunkSize; ++lx) {
     int wx = baseX + lx;
@@ -673,7 +1282,7 @@ void generateChunk(Chunk& chunk, uint32_t seed) {
         if (wy > top || wy < 0 || wy >= kWorldY) {
           continue;
         }
-        if (shouldCarveCave(wx, wy, wz, top, seed)) {
+        if (shouldCarveCave(caveSegments, wx, wy, wz, top, seed)) {
           continue;
         }
         BlockType type = BlockStone;
@@ -686,6 +1295,8 @@ void generateChunk(Chunk& chunk, uint32_t seed) {
       }
     }
   }
+
+  carveLakeInChunk(chunk, lake, seed);
 
   int padding = 3;
   int minX = baseX - padding;
@@ -700,94 +1311,164 @@ void generateChunk(Chunk& chunk, uint32_t seed) {
       if (top < 1 || top >= kWorldY - 2) {
         continue;
       }
+      if (lakeContains(lake, x, z, seed)) {
+        continue;
+      }
       float forestNoise = fbmPerlin(static_cast<float>(x) * 0.006f, static_cast<float>(z) * 0.006f, 3, 2.0f, 0.5f);
-      float density = (forestNoise - 0.4f) * 1.4f;
-      bool dense = density > 0.3f;
+      float density = (forestNoise - 0.5f) * 1.1f;
+      bool dense = density > 0.35f;
       if (!shouldPlaceTree(x, z, top, biome, seed)) {
+        continue;
+      }
+      if (!isTreeSpacingClear(x, z, top, biome, seed)) {
         continue;
       }
       int height = treeHeightAt(x, z, seed, dense);
       placeTreeInChunk(chunk, x, z, top, height);
     }
   }
+
+  removeInteriorBlocks(chunk);
 }
 
-void computeChunkLight(const World& world, Chunk& chunk) {
-  chunk.light.assign(kChunkVolume, 0u);
-  std::vector<int> queue;
-  queue.reserve(kChunkVolume);
+void removeInteriorBlocks(Chunk& chunk) {
+  if (chunk.blocks.empty()) {
+    return;
+  }
 
-  int baseX = chunk.cx * kChunkSize;
+  for (int lx = 0; lx < kChunkSize; ++lx) {
+    for (int ly = 0; ly < kChunkSize; ++ly) {
+      for (int lz = 0; lz < kChunkSize; ++lz) {
+        BlockType type = blockAtLocal(chunk, lx, ly, lz);
+        if (type == BlockAir) {
+          continue;
+        }
+
+        bool hasAirNeighbor = false;
+        const int neighbors[6][3] = {
+          {-1, 0, 0}, {1, 0, 0}, {0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}
+        };
+
+        for (const auto& n : neighbors) {
+          int nlx = lx + n[0];
+          int nly = ly + n[1];
+          int nlz = lz + n[2];
+
+          if (nlx < 0 || nlx >= kChunkSize || nly < 0 || nly >= kChunkSize || nlz < 0 || nlz >= kChunkSize) {
+            hasAirNeighbor = true;
+            break;
+          }
+
+          BlockType neighbor = blockAtLocal(chunk, nlx, nly, nlz);
+          if (neighbor == BlockAir) {
+            hasAirNeighbor = true;
+            break;
+          }
+        }
+
+        if (!hasAirNeighbor) {
+          chunk.blocks[blockIndex(lx, ly, lz)] = static_cast<uint8_t>(BlockAir);
+        }
+      }
+    }
+  }
+}
+
+void computeChunkLight(const World& world, Chunk& chunk, bool fullPropagation) {
+  chunk.light.assign(kChunkVolume, 0u);
+
   int baseY = chunk.cy * kChunkSize;
-  int baseZ = chunk.cz * kChunkSize;
   int topY = baseY + kChunkSize - 1;
 
   for (int lx = 0; lx < kChunkSize; ++lx) {
-    int wx = baseX + lx;
     for (int lz = 0; lz < kChunkSize; ++lz) {
-      int wz = baseZ + lz;
-      bool blocked = false;
-      for (int wy = kWorldY - 1; wy > topY; --wy) {
-        if (isLightBlocking(blockAtInternal(world, wx, wy, wz))) {
-          blocked = true;
+      int highestSolid = -1;
+      for (int ly = kChunkSize - 1; ly >= 0; --ly) {
+        BlockType type = blockAtLocal(chunk, lx, ly, lz);
+        if (isLightBlocking(type)) {
+          highestSolid = ly;
           break;
         }
       }
 
-      for (int wy = topY; wy >= baseY; --wy) {
-        BlockType type = blockAtInternal(world, wx, wy, wz);
-        if (isLightBlocking(type)) {
-          blocked = true;
-          continue;
-        }
-        if (blocked) {
-          continue;
-        }
-        int ly = wy - baseY;
+      for (int ly = 0; ly < kChunkSize; ++ly) {
         int index = blockIndex(lx, ly, lz);
-        if (chunk.light[index] == 0u) {
+        BlockType type = blockAtLocal(chunk, lx, ly, lz);
+        
+        if (type == BlockTorch) {
           chunk.light[index] = static_cast<uint8_t>(kMaxLightLevel);
-          queue.push_back(index);
+          continue;
+        }
+        if (type == BlockAir) {
+          int wy = baseY + ly;
+          if (ly > highestSolid) {
+            chunk.light[index] = static_cast<uint8_t>(kMaxLightLevel);
+          } else {
+            chunk.light[index] = 2;
+          }
+        } else {
+          int wy = baseY + ly;
+          if (ly == highestSolid) {
+            chunk.light[index] = static_cast<uint8_t>(kMaxLightLevel);
+          } else {
+            int depthFromTop = (kWorldY - 1) - wy;
+            int light = kMaxLightLevel - (depthFromTop / 6);
+            if (light < 3) light = 3;
+            chunk.light[index] = static_cast<uint8_t>(light);
+          }
         }
       }
     }
   }
 
-  size_t head = 0;
-  while (head < queue.size()) {
-    int index = queue[head++];
-    int lx = index % kChunkSize;
-    int ly = (index / kChunkSize) % kChunkSize;
-    int lz = index / (kChunkSize * kChunkSize);
-    uint8_t light = chunk.light[index];
-    if (light <= 1u) {
-      continue;
-    }
-    int wx = baseX + lx;
-    int wy = baseY + ly;
-    int wz = baseZ + lz;
-    const int offsets[6][3] = {
-      {1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
-      {0, -1, 0}, {0, 0, 1}, {0, 0, -1},
-    };
-    for (const auto& offset : offsets) {
-      int nx = wx + offset[0];
-      int ny = wy + offset[1];
-      int nz = wz + offset[2];
-      if (!blockInsideChunk(chunk, nx, ny, nz)) {
-        continue;
-      }
-      if (isLightBlocking(blockAtInternal(world, nx, ny, nz))) {
-        continue;
-      }
-      int nlx = nx - baseX;
-      int nly = ny - baseY;
-      int nlz = nz - baseZ;
-      int nindex = blockIndex(nlx, nly, nlz);
-      uint8_t nextLight = static_cast<uint8_t>(light - 1u);
-      if (chunk.light[nindex] + 1u <= nextLight) {
-        chunk.light[nindex] = nextLight;
-        queue.push_back(nindex);
+  int propagationPasses = fullPropagation ? 3 : 1;
+  for (int pass = 0; pass < propagationPasses; ++pass) {
+    for (int ly = kChunkSize - 1; ly >= 0; --ly) {
+      for (int lz = 0; lz < kChunkSize; ++lz) {
+        for (int lx = 0; lx < kChunkSize; ++lx) {
+          int index = blockIndex(lx, ly, lz);
+          BlockType type = blockAtLocal(chunk, lx, ly, lz);
+          
+          if (isLightBlocking(type)) {
+            continue;
+          }
+          
+          uint8_t currentLight = chunk.light[index];
+          uint8_t maxNeighborLight = currentLight;
+          
+          const int neighbors[6][3] = {
+            {-1, 0, 0}, {1, 0, 0}, {0, 0, -1}, {0, 0, 1}, {0, 1, 0}, {0, -1, 0}
+          };
+          
+          for (const auto& n : neighbors) {
+            int nlx = lx + n[0];
+            int nly = ly + n[1];
+            int nlz = lz + n[2];
+            
+            if (nlx < 0 || nlx >= kChunkSize || 
+                nly < 0 || nly >= kChunkSize || 
+                nlz < 0 || nlz >= kChunkSize) {
+              continue;
+            }
+            
+            BlockType neighborType = blockAtLocal(chunk, nlx, nly, nlz);
+            if (isLightBlocking(neighborType)) {
+              continue;
+            }
+            
+            uint8_t neighborLight = chunk.light[blockIndex(nlx, nly, nlz)];
+            if (neighborLight > maxNeighborLight) {
+              maxNeighborLight = neighborLight;
+            }
+          }
+          
+          if (maxNeighborLight > currentLight + 1) {
+            uint8_t newLight = maxNeighborLight - 1;
+            if (newLight > currentLight) {
+              chunk.light[index] = newLight;
+            }
+          }
+        }
       }
     }
   }
@@ -795,17 +1476,19 @@ void computeChunkLight(const World& world, Chunk& chunk) {
 
 struct TempBatch {
   unsigned int textureId;
+  bool transparent;
+  bool animated;
   std::vector<Vertex> vertices;
   std::vector<uint32_t> indices;
 };
 
-TempBatch& getBatch(std::vector<TempBatch>& batches, unsigned int textureId) {
+TempBatch& getBatch(std::vector<TempBatch>& batches, unsigned int textureId, bool transparent, bool animated) {
   for (auto& batch : batches) {
-    if (batch.textureId == textureId) {
+    if (batch.textureId == textureId && batch.transparent == transparent && batch.animated == animated) {
       return batch;
     }
   }
-  batches.push_back(TempBatch{textureId, {}, {}});
+  batches.push_back(TempBatch{textureId, transparent, animated, {}, {}});
   return batches.back();
 }
 
@@ -821,6 +1504,10 @@ void buildChunkMesh(const TextureAssets& textures, Chunk& chunk, int lodStep, ui
   chunk.vertices.clear();
   chunk.indices.clear();
   chunk.batches.clear();
+
+  int estimatedFaces = (size * size * size) * 3;
+  chunk.vertices.reserve(estimatedFaces * 4);
+  chunk.indices.reserve(estimatedFaces * 6);
 
   int baseX = chunk.cx * kChunkSize;
   int baseY = chunk.cy * kChunkSize;
@@ -841,7 +1528,7 @@ void buildChunkMesh(const TextureAssets& textures, Chunk& chunk, int lodStep, ui
         int index = y * size + z;
         BlockType type = sampleBlockRegion(chunk, lx, ly, lz, lodStep);
         if (type == BlockAir ||
-            neighborRegionIsFullySolid(chunk, chunkXPos, lx, ly, lz, lodStep, 1, 0, 0)) {
+            neighborRegionIsFullySolid(chunk, chunkXPos, lx, ly, lz, lodStep, 1, 0, 0, type)) {
           mask[index].visible = false;
           continue;
         }
@@ -857,7 +1544,7 @@ void buildChunkMesh(const TextureAssets& textures, Chunk& chunk, int lodStep, ui
       float y1 = y0 + stepSize * static_cast<float>(h);
       float z0 = static_cast<float>(u * lodStep) * kBlockSize;
       float z1 = z0 + stepSize * static_cast<float>(w);
-      TempBatch& batch = getBatch(tempBatches, key.textureId);
+      TempBatch& batch = getBatch(tempBatches, key.textureId, key.transparent, key.animated);
       addQuad(batch.vertices, batch.indices, {1.0f, 0.0f, 0.0f}, colorFromKey(key),
               {xPlane, y0, z0}, {xPlane, y0, z1}, {xPlane, y1, z1}, {xPlane, y1, z0},
               static_cast<float>(w * lodStep), static_cast<float>(h * lodStep));
@@ -873,7 +1560,7 @@ void buildChunkMesh(const TextureAssets& textures, Chunk& chunk, int lodStep, ui
         int index = y * size + z;
         BlockType type = sampleBlockRegion(chunk, lx, ly, lz, lodStep);
         if (type == BlockAir ||
-            neighborRegionIsFullySolid(chunk, chunkXNeg, lx, ly, lz, lodStep, -1, 0, 0)) {
+            neighborRegionIsFullySolid(chunk, chunkXNeg, lx, ly, lz, lodStep, -1, 0, 0, type)) {
           mask[index].visible = false;
           continue;
         }
@@ -889,7 +1576,7 @@ void buildChunkMesh(const TextureAssets& textures, Chunk& chunk, int lodStep, ui
       float y1 = y0 + stepSize * static_cast<float>(h);
       float z0 = static_cast<float>(u * lodStep) * kBlockSize;
       float z1 = z0 + stepSize * static_cast<float>(w);
-      TempBatch& batch = getBatch(tempBatches, key.textureId);
+      TempBatch& batch = getBatch(tempBatches, key.textureId, key.transparent, key.animated);
       addQuad(batch.vertices, batch.indices, {-1.0f, 0.0f, 0.0f}, colorFromKey(key),
               {xPlane, y0, z1}, {xPlane, y0, z0}, {xPlane, y1, z0}, {xPlane, y1, z1},
               static_cast<float>(w * lodStep), static_cast<float>(h * lodStep));
@@ -905,7 +1592,7 @@ void buildChunkMesh(const TextureAssets& textures, Chunk& chunk, int lodStep, ui
         int index = z * size + x;
         BlockType type = sampleBlockRegion(chunk, lx, ly, lz, lodStep);
         if (type == BlockAir ||
-            neighborRegionIsFullySolid(chunk, chunkYPos, lx, ly, lz, lodStep, 0, 1, 0)) {
+            neighborRegionIsFullySolid(chunk, chunkYPos, lx, ly, lz, lodStep, 0, 1, 0, type)) {
           mask[index].visible = false;
           continue;
         }
@@ -921,7 +1608,7 @@ void buildChunkMesh(const TextureAssets& textures, Chunk& chunk, int lodStep, ui
       float x1 = x0 + stepSize * static_cast<float>(w);
       float z0 = static_cast<float>(v * lodStep) * kBlockSize;
       float z1 = z0 + stepSize * static_cast<float>(h);
-      TempBatch& batch = getBatch(tempBatches, key.textureId);
+      TempBatch& batch = getBatch(tempBatches, key.textureId, key.transparent, key.animated);
       addQuad(batch.vertices, batch.indices, {0.0f, 1.0f, 0.0f}, colorFromKey(key),
               {x0, yPlane, z0}, {x1, yPlane, z0}, {x1, yPlane, z1}, {x0, yPlane, z1},
               static_cast<float>(w * lodStep), static_cast<float>(h * lodStep));
@@ -937,7 +1624,7 @@ void buildChunkMesh(const TextureAssets& textures, Chunk& chunk, int lodStep, ui
         int index = z * size + x;
         BlockType type = sampleBlockRegion(chunk, lx, ly, lz, lodStep);
         if (type == BlockAir ||
-            neighborRegionIsFullySolid(chunk, chunkYNeg, lx, ly, lz, lodStep, 0, -1, 0)) {
+            neighborRegionIsFullySolid(chunk, chunkYNeg, lx, ly, lz, lodStep, 0, -1, 0, type)) {
           mask[index].visible = false;
           continue;
         }
@@ -953,7 +1640,7 @@ void buildChunkMesh(const TextureAssets& textures, Chunk& chunk, int lodStep, ui
       float x1 = x0 + stepSize * static_cast<float>(w);
       float z0 = static_cast<float>(v * lodStep) * kBlockSize;
       float z1 = z0 + stepSize * static_cast<float>(h);
-      TempBatch& batch = getBatch(tempBatches, key.textureId);
+      TempBatch& batch = getBatch(tempBatches, key.textureId, key.transparent, key.animated);
       addQuad(batch.vertices, batch.indices, {0.0f, -1.0f, 0.0f}, colorFromKey(key),
               {x0, yPlane, z1}, {x1, yPlane, z1}, {x1, yPlane, z0}, {x0, yPlane, z0},
               static_cast<float>(w * lodStep), static_cast<float>(h * lodStep));
@@ -969,7 +1656,7 @@ void buildChunkMesh(const TextureAssets& textures, Chunk& chunk, int lodStep, ui
         int index = y * size + x;
         BlockType type = sampleBlockRegion(chunk, lx, ly, lz, lodStep);
         if (type == BlockAir ||
-            neighborRegionIsFullySolid(chunk, chunkZPos, lx, ly, lz, lodStep, 0, 0, 1)) {
+            neighborRegionIsFullySolid(chunk, chunkZPos, lx, ly, lz, lodStep, 0, 0, 1, type)) {
           mask[index].visible = false;
           continue;
         }
@@ -985,7 +1672,7 @@ void buildChunkMesh(const TextureAssets& textures, Chunk& chunk, int lodStep, ui
       float x1 = x0 + stepSize * static_cast<float>(w);
       float y0 = static_cast<float>(v * lodStep) * kBlockSize;
       float y1 = y0 + stepSize * static_cast<float>(h);
-      TempBatch& batch = getBatch(tempBatches, key.textureId);
+      TempBatch& batch = getBatch(tempBatches, key.textureId, key.transparent, key.animated);
       addQuad(batch.vertices, batch.indices, {0.0f, 0.0f, 1.0f}, colorFromKey(key),
               {x1, y0, zPlane}, {x0, y0, zPlane}, {x0, y1, zPlane}, {x1, y1, zPlane},
               static_cast<float>(w * lodStep), static_cast<float>(h * lodStep));
@@ -1001,7 +1688,7 @@ void buildChunkMesh(const TextureAssets& textures, Chunk& chunk, int lodStep, ui
         int index = y * size + x;
         BlockType type = sampleBlockRegion(chunk, lx, ly, lz, lodStep);
         if (type == BlockAir ||
-            neighborRegionIsFullySolid(chunk, chunkZNeg, lx, ly, lz, lodStep, 0, 0, -1)) {
+            neighborRegionIsFullySolid(chunk, chunkZNeg, lx, ly, lz, lodStep, 0, 0, -1, type)) {
           mask[index].visible = false;
           continue;
         }
@@ -1017,7 +1704,7 @@ void buildChunkMesh(const TextureAssets& textures, Chunk& chunk, int lodStep, ui
       float x1 = x0 + stepSize * static_cast<float>(w);
       float y0 = static_cast<float>(v * lodStep) * kBlockSize;
       float y1 = y0 + stepSize * static_cast<float>(h);
-      TempBatch& batch = getBatch(tempBatches, key.textureId);
+      TempBatch& batch = getBatch(tempBatches, key.textureId, key.transparent, key.animated);
       addQuad(batch.vertices, batch.indices, {0.0f, 0.0f, -1.0f}, colorFromKey(key),
               {x0, y0, zPlane}, {x1, y0, zPlane}, {x1, y1, zPlane}, {x0, y1, zPlane},
               static_cast<float>(w * lodStep), static_cast<float>(h * lodStep));
@@ -1030,8 +1717,23 @@ void buildChunkMesh(const TextureAssets& textures, Chunk& chunk, int lodStep, ui
     totalVerts += batch.vertices.size();
     totalIndices += batch.indices.size();
   }
-  chunk.vertices.reserve(totalVerts);
-  chunk.indices.reserve(totalIndices);
+  if (chunk.vertices.capacity() < totalVerts) {
+    chunk.vertices.reserve(totalVerts);
+  }
+  if (chunk.indices.capacity() < totalIndices) {
+    chunk.indices.reserve(totalIndices);
+  }
+
+  std::sort(tempBatches.begin(), tempBatches.end(),
+            [](const TempBatch& a, const TempBatch& b) {
+              if (a.transparent != b.transparent) {
+                return a.transparent < b.transparent;
+              }
+              if (a.animated != b.animated) {
+                return a.animated < b.animated;
+              }
+              return a.textureId < b.textureId;
+            });
 
   for (auto& batch : tempBatches) {
     if (batch.vertices.empty() || batch.indices.empty()) {
@@ -1041,6 +1743,8 @@ void buildChunkMesh(const TextureAssets& textures, Chunk& chunk, int lodStep, ui
     out.textureId = batch.textureId;
     out.indexOffset = static_cast<int>(chunk.indices.size());
     out.indexCount = static_cast<int>(batch.indices.size());
+    out.transparent = batch.transparent;
+    out.animated = batch.animated;
     chunk.batches.push_back(out);
 
     uint32_t baseVertex = static_cast<uint32_t>(chunk.vertices.size());
@@ -1133,9 +1837,21 @@ MeshBuildResult buildChunkMeshAsync(MeshBuildInput input) {
   return result;
 }
 
-void enqueueMeshBuild(World& world, const TextureAssets& textures, const Chunk& chunk, int lodStep) {
+void enqueueMeshBuild(World& world, const TextureAssets& textures, Chunk& chunk, int lodStep) {
   ChunkCoord coord = chunkCoord(chunk.cx, chunk.cy, chunk.cz);
   if (world.queuedMeshes.find(coord) != world.queuedMeshes.end()) {
+    return;
+  }
+  
+  uint64_t meshKey = (chunk.contentHash << 3) | (static_cast<uint64_t>(lodStep) & 0x7);
+  bool recomputedLighting = false;
+  if (chunk.light.size() != kChunkVolume) {
+    computeChunkLight(world, chunk, false);
+    chunk.lastMeshHash = 0;
+    recomputedLighting = true;
+  }
+
+  if (!recomputedLighting && chunk.lastMeshHash == meshKey && !chunk.vertices.empty()) {
     return;
   }
 
@@ -1157,36 +1873,6 @@ void enqueueMeshBuild(World& world, const TextureAssets& textures, const Chunk& 
 
   world.queuedMeshes.insert(coord);
   world.meshTasks.push_back({coord, std::async(std::launch::async, buildChunkMeshAsync, std::move(input))});
-}
-
-bool chunkInView(const ChunkCoord& coord, Vec3 cameraPos, Vec3 cameraFront,
-                 Vec3 cameraUp, Vec3 cameraRight, float tanHalfFovX, float tanHalfFovY) {
-  float centerX = static_cast<float>(coord.cx * kChunkSize) * kBlockSize + kChunkHalfSize;
-  float centerY = static_cast<float>(coord.cy * kChunkSize) * kBlockSize + kChunkHalfSize;
-  float centerZ = static_cast<float>(coord.cz * kChunkSize) * kBlockSize + kChunkHalfSize;
-  Vec3 toCenter = {centerX - cameraPos.x, centerY - cameraPos.y, centerZ - cameraPos.z};
-  float distSq = dot(toCenter, toCenter);
-  if (distSq <= kChunkRadius * kChunkRadius) {
-    return true;
-  }
-
-  float forward = dot(toCenter, cameraFront);
-  if (forward <= 0.0f) {
-    return false;
-  }
-
-  float right = dot(toCenter, cameraRight);
-  float up = dot(toCenter, cameraUp);
-
-  float maxRight = forward * tanHalfFovX + kChunkRadius;
-  float maxUp = forward * tanHalfFovY + kChunkRadius;
-  if (std::fabs(right) > maxRight) {
-    return false;
-  }
-  if (std::fabs(up) > maxUp) {
-    return false;
-  }
-  return true;
 }
 
 int lodStepForDistance(int distance) {
@@ -1214,6 +1900,9 @@ void initWorld(World& world) {
   world.meshTasks.clear();
   world.visibleChunks.clear();
   world.pendingChunks.clear();
+  world.enableOcclusionCulling = false;
+  world.loadedChunkCount = 0;
+  world.maxLoadedChunks = 20000;
 }
 
 const Chunk* findChunk(const World& world, int cx, int cy, int cz) {
@@ -1242,7 +1931,8 @@ Chunk& getOrCreateChunk(World& world, const TextureAssets& textures, int cx, int
   chunk.lodStep = 1;
   chunk.blocks.assign(kChunkVolume, static_cast<uint8_t>(BlockAir));
   generateChunk(chunk, world.seed);
-  computeChunkLight(world, chunk);
+  recomputeChunkMetadata(chunk);
+  computeChunkLight(world, chunk, false);
   auto result = world.chunks.emplace(key, std::move(chunk));
   enqueueMeshBuild(world, textures, result.first->second, result.first->second.lodStep);
   created = true;
@@ -1258,8 +1948,17 @@ Chunk buildChunkData(const ChunkCoord& coord, uint32_t seed) {
   chunk.ibo = 0;
   chunk.meshDirty = false;
   chunk.lodStep = 1;
+  chunk.maxHeight = 0;
+  chunk.faceOpenMask = 0;
+  chunk.contentHash = 0;
+  chunk.lastMeshHash = 0;
+  chunk.isEmpty = true;
+  chunk.isSolid = false;
+  chunk.lastAccessTime = 0.0;
   chunk.blocks.assign(kChunkVolume, static_cast<uint8_t>(BlockAir));
   generateChunk(chunk, seed);
+  recomputeChunkMetadata(chunk);
+  
   return chunk;
 }
 
@@ -1268,9 +1967,185 @@ bool isFutureReady(const std::future<T>& future) {
   return future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
 }
 
+int getColumnMaxHeight(const World& world, int cx, int cz) {
+  int64_t key = (static_cast<int64_t>(cx) << 32) | static_cast<int64_t>(cz);
+  auto it = world.heightmapCache.find(key);
+  if (it != world.heightmapCache.end()) {
+    return it->second;
+  }
+  
+  int maxHeight = 0;
+  for (int cy = 0; cy < kChunksY; ++cy) {
+    const Chunk* chunk = findChunkInternal(world, cx, cy, cz);
+    if (chunk && chunk->maxHeight > maxHeight) {
+      maxHeight = chunk->maxHeight;
+    }
+  }
+  return maxHeight;
+}
+
+void updateHeightmapCache(World& world, int cx, int cz) {
+  int maxHeight = 0;
+  for (int cy = 0; cy < kChunksY; ++cy) {
+    const Chunk* chunk = findChunkInternal(world, cx, cy, cz);
+    if (chunk && chunk->maxHeight > maxHeight) {
+      maxHeight = chunk->maxHeight;
+    }
+  }
+  int64_t key = (static_cast<int64_t>(cx) << 32) | static_cast<int64_t>(cz);
+  world.heightmapCache[key] = maxHeight;
+}
+
+bool isChunkOccluded(const World& world, Vec3 playerPos, int targetCx, int targetCy, int targetCz) {
+  int playerChunkX = floorDiv(worldToBlock(playerPos.x), kChunkSize);
+  int playerChunkZ = floorDiv(worldToBlock(playerPos.z), kChunkSize);
+  int playerY = worldToBlock(playerPos.y);
+  
+  int dx = targetCx - playerChunkX;
+  int dz = targetCz - playerChunkZ;
+  int distSq = dx * dx + dz * dz;
+  if (distSq <= 4) {
+    return false;
+  }
+  
+  int targetHeight = getColumnMaxHeight(world, targetCx, targetCz);
+  int targetChunkMinY = targetCy * kChunkSize;
+  int targetChunkMaxY = (targetCy + 1) * kChunkSize - 1;
+  
+  if (targetChunkMinY > targetHeight) {
+    return false;
+  }
+  
+  float centerX = static_cast<float>(targetCx * kChunkSize) + kChunkHalfSize * kBlockSize;
+  float centerZ = static_cast<float>(targetCz * kChunkSize) + kChunkHalfSize * kBlockSize;
+  float centerY = static_cast<float>((targetChunkMinY + targetChunkMaxY) / 2) * kBlockSize;
+  
+  Vec3 toTarget = {centerX - playerPos.x, centerY - playerPos.y, centerZ - playerPos.z};
+  float distance = std::sqrt(toTarget.x * toTarget.x + toTarget.y * toTarget.y + toTarget.z * toTarget.z);
+  
+  if (distance < 0.1f) {
+    return false;
+  }
+
+  toTarget.x /= distance;
+  toTarget.y /= distance;
+  toTarget.z /= distance;
+  int steps = static_cast<int>(distance / (kChunkSize * kBlockSize)) + 1;
+  if (steps > 20) steps = 20;
+  
+  for (int i = 1; i < steps; ++i) {
+    float t = (distance * static_cast<float>(i)) / static_cast<float>(steps);
+    float sampleX = playerPos.x + toTarget.x * t;
+    float sampleZ = playerPos.z + toTarget.z * t;
+    float sampleY = playerPos.y + toTarget.y * t;
+    
+    int sampleCx = floorDiv(worldToBlock(sampleX), kChunkSize);
+    int sampleCz = floorDiv(worldToBlock(sampleZ), kChunkSize);
+    int sampleWy = worldToBlock(sampleY);
+
+    int sampleCy = floorDiv(sampleWy, kChunkSize);
+    const Chunk* sampleChunk = findChunkInternal(world, sampleCx, sampleCy, sampleCz);
+    if (sampleChunk && !sampleChunk->isEmpty && !sampleChunk->blocks.empty()) {
+      int dxToTarget = targetCx - sampleCx;
+      int dyToTarget = targetCy - sampleChunk->cy;
+      int dzToTarget = targetCz - sampleCz;
+      int adx = std::abs(dxToTarget);
+      int ady = std::abs(dyToTarget);
+      int adz = std::abs(dzToTarget);
+      uint8_t faceMask = 0u;
+      if (adx >= ady && adx >= adz) {
+        faceMask = dxToTarget > 0 ? kFaceXPos : kFaceXNeg;
+      } else if (ady >= adx && ady >= adz) {
+        faceMask = dyToTarget > 0 ? kFaceYPos : kFaceYNeg;
+      } else {
+        faceMask = dzToTarget > 0 ? kFaceZPos : kFaceZNeg;
+      }
+
+      if ((sampleChunk->faceOpenMask & faceMask) == 0u) {
+        return true;
+      }
+    }
+    
+    int terrainHeight = getColumnMaxHeight(world, sampleCx, sampleCz);
+    
+    if (terrainHeight > sampleWy + kChunkSize && terrainHeight > playerY) {
+      if (terrainHeight >= targetChunkMaxY) return true;
+    }
+  }
+  
+  return false;
+}
+
+bool isChunkInFrustum(Vec3 chunkCenter, Vec3 cameraPos, Vec3 cameraFront, Vec3 cameraRight, Vec3 cameraUp,
+                      float tanHalfFovX, float tanHalfFovY) {
+  Vec3 toChunk = {chunkCenter.x - cameraPos.x, chunkCenter.y - cameraPos.y, chunkCenter.z - cameraPos.z};
+  float distance = std::sqrt(toChunk.x * toChunk.x + toChunk.y * toChunk.y + toChunk.z * toChunk.z);
+  
+  if (distance < 0.1f) {
+    return true;
+  }
+  
+  toChunk.x /= distance;
+  toChunk.y /= distance;
+  toChunk.z /= distance;
+  
+  float forward = dot(toChunk, cameraFront);
+  if (forward < -0.2f) {
+    return false;
+  }
+  
+  float right = dot(toChunk, cameraRight);
+  float maxRight = tanHalfFovX * forward + kChunkRadius / distance;
+  if (std::abs(right) > maxRight) {
+    return false;
+  }
+  
+  float up = dot(toChunk, cameraUp);
+  float maxUp = tanHalfFovY * forward + kChunkRadius / distance;
+  if (std::abs(up) > maxUp) {
+    return false;
+  }
+  
+  return true;
+}
+
+void unloadDistantChunks(World& world, int pcx, int pcy, int pcz) {
+  if (world.chunks.size() < world.maxLoadedChunks) {
+    return;
+  }
+  std::vector<ChunkCoord> toUnload;
+  int unloadRadius = world.renderDistance + kFarLodRing + 2;
+  
+  for (const auto& entry : world.chunks) {
+    const Chunk& chunk = entry.second;
+    int dist = std::abs(chunk.cx - pcx);
+    dist = std::max(dist, std::abs(chunk.cy - pcy));
+    dist = std::max(dist, std::abs(chunk.cz - pcz));
+    
+    if (dist > unloadRadius) {
+      toUnload.push_back(entry.first);
+    }
+  }
+
+  for (const ChunkCoord& coord : toUnload) {
+    auto it = world.chunks.find(coord);
+    if (it != world.chunks.end()) {
+      if (it->second.vbo != 0) {
+        glDeleteBuffers(1, &it->second.vbo);
+      }
+      if (it->second.ibo != 0) {
+        glDeleteBuffers(1, &it->second.ibo);
+      }
+      world.chunks.erase(it);
+    }
+  }
+  
+  world.loadedChunkCount = world.chunks.size();
+}
+
 void updateWorldChunks(World& world, const TextureAssets& textures, Vec3 playerPosition,
                        Vec3 cameraFront, Vec3 cameraUp, Vec3 cameraRight,
-                       float fovDegrees, float aspect) {
+                       float fovDegrees, float aspect, double timeNow) {
   int wx = worldToBlock(playerPosition.x);
   int wz = worldToBlock(playerPosition.z);
   int wy = worldToBlock(playerPosition.y);
@@ -1278,23 +2153,54 @@ void updateWorldChunks(World& world, const TextureAssets& textures, Vec3 playerP
   int pcy = floorDiv(wy, kChunkSize);
   int pcz = floorDiv(wz, kChunkSize);
 
+  unloadDistantChunks(world, pcx, pcy, pcz);
+
   int meshApplied = 0;
-  for (auto it = world.meshTasks.begin(); it != world.meshTasks.end(); ) {
+  int maxMeshPerFrame = kMeshBuildPerFrame * 3;
+  int nearbyPassLimit = maxMeshPerFrame / 2;
+  int nearbyProcessed = 0;
+  
+  for (auto it = world.meshTasks.begin(); it != world.meshTasks.end() && nearbyProcessed < nearbyPassLimit; ) {
     if (!isFutureReady(it->future)) {
       ++it;
       continue;
     }
-    if (meshApplied >= kMeshBuildPerFrame) {
-      break;
+    int dist = std::abs(it->coord.cx - pcx) + std::abs(it->coord.cy - pcy) + std::abs(it->coord.cz - pcz);
+    if (dist > 2) {
+      ++it;
+      continue;
     }
+    
     MeshBuildResult result = it->future.get();
     world.queuedMeshes.erase(result.coord);
     Chunk* chunk = findChunkInternal(world, result.coord.cx, result.coord.cy, result.coord.cz);
-    if (chunk && chunk->lodStep == result.lodStep) {
+    if (chunk && chunk->lodStep == result.lodStep && chunk->blocks.size() > 0) {
       chunk->vertices = std::move(result.vertices);
       chunk->indices = std::move(result.indices);
       chunk->batches = std::move(result.batches);
       chunk->meshDirty = true;
+      chunk->lastMeshHash = (chunk->contentHash << 3) | (static_cast<uint64_t>(result.lodStep) & 0x7);
+    }
+    it = world.meshTasks.erase(it);
+    nearbyProcessed++;
+    meshApplied++;
+  }
+  
+  for (auto it = world.meshTasks.begin(); it != world.meshTasks.end() && meshApplied < maxMeshPerFrame; ) {
+    if (!isFutureReady(it->future)) {
+      ++it;
+      continue;
+    }
+    
+    MeshBuildResult result = it->future.get();
+    world.queuedMeshes.erase(result.coord);
+    Chunk* chunk = findChunkInternal(world, result.coord.cx, result.coord.cy, result.coord.cz);
+    if (chunk && chunk->lodStep == result.lodStep && chunk->blocks.size() > 0) {
+      chunk->vertices = std::move(result.vertices);
+      chunk->indices = std::move(result.indices);
+      chunk->batches = std::move(result.batches);
+      chunk->meshDirty = true;
+      chunk->lastMeshHash = (chunk->contentHash << 3) | (static_cast<uint64_t>(result.lodStep) & 0x7);
     }
     it = world.meshTasks.erase(it);
     meshApplied++;
@@ -1310,8 +2216,15 @@ void updateWorldChunks(World& world, const TextureAssets& textures, Vec3 playerP
     ChunkCoord key = it->coord;
     auto existing = world.chunks.find(key);
     if (existing == world.chunks.end()) {
+      World tempWorld;
+      tempWorld.chunks[key] = chunk;
+      computeChunkLight(tempWorld, tempWorld.chunks[key], false);
+      chunk = std::move(tempWorld.chunks[key]);
+      
       auto result = world.chunks.emplace(key, std::move(chunk));
-      computeChunkLight(world, result.first->second);
+      
+      updateHeightmapCache(world, result.first->second.cx, result.first->second.cz);
+      
       int dist = std::abs(result.first->second.cx - pcx);
       dist = std::max(dist, std::abs(result.first->second.cy - pcy));
       dist = std::max(dist, std::abs(result.first->second.cz - pcz));
@@ -1353,21 +2266,40 @@ void updateWorldChunks(World& world, const TextureAssets& textures, Vec3 playerP
         if (std::abs(dx) != radius && std::abs(dz) != radius) {
           continue;
         }
-        if (dx * dx + dz * dz > maxRadius * maxRadius) {
+        int distSq = dx * dx + dz * dz;
+        if (distSq > maxRadius * maxRadius) {
           continue;
         }
         int cx = pcx + dx;
         int cz = pcz + dz;
         for (int cy = minCy; cy <= maxCy; ++cy) {
-          const Chunk* chunk = findChunkInternal(world, cx, cy, cz);
-          if (chunk) {
-            ChunkCoord coord = chunkCoord(chunk->cx, chunk->cy, chunk->cz);
-            if (!useFrustum || chunkInView(coord, playerPosition, cameraFront, cameraUp, cameraRight,
-                                           tanHalfFovX, tanHalfFovY)) {
-              world.visibleChunks.push_back(coord);
+          ChunkCoord coord = chunkCoord(cx, cy, cz);
+          
+          float centerX = static_cast<float>(cx * kChunkSize) * kBlockSize + kChunkHalfSize;
+          float centerY = static_cast<float>(cy * kChunkSize) * kBlockSize + kChunkHalfSize;
+          float centerZ = static_cast<float>(cz * kChunkSize) * kBlockSize + kChunkHalfSize;
+          Vec3 chunkCenter = {centerX, centerY, centerZ};
+          
+          if (useFrustum && radius > 1) {
+            if (!isChunkInFrustum(chunkCenter, playerPosition, cameraFront, cameraRight, cameraUp,
+                                 tanHalfFovX, tanHalfFovY)) {
+              continue;
             }
-          } else {
-            world.pendingChunks.push_back(chunkCoord(cx, cy, cz));
+          }
+          
+          bool occluded = false;
+          if (world.enableOcclusionCulling && radius > 3) {
+            occluded = isChunkOccluded(world, playerPosition, cx, cy, cz);
+          }
+          
+          if (!occluded) {
+            Chunk* chunk = findChunkInternal(world, cx, cy, cz);
+            if (chunk) {
+              chunk->lastAccessTime = timeNow;
+              world.visibleChunks.push_back(coord);
+            } else {
+              world.pendingChunks.push_back(coord);
+            }
           }
         }
       }
@@ -1375,19 +2307,24 @@ void updateWorldChunks(World& world, const TextureAssets& textures, Vec3 playerP
   }
 
   int meshScheduled = 0;
+  int maxMeshSchedule = kMeshBuildPerFrame * 2;
   for (const ChunkCoord& coord : world.visibleChunks) {
-    if (meshScheduled >= kMeshBuildPerFrame) {
+    if (meshScheduled >= maxMeshSchedule) {
       break;
     }
     Chunk* chunk = findChunkInternal(world, coord.cx, coord.cy, coord.cz);
-    if (!chunk) {
+    if (!chunk || chunk->blocks.empty()) {
       continue;
     }
     int dist = std::abs(coord.cx - pcx);
     dist = std::max(dist, std::abs(coord.cy - pcy));
     dist = std::max(dist, std::abs(coord.cz - pcz));
     int lodStep = lodStepForDistance(dist);
-    if (chunk->lodStep != lodStep) {
+    bool needsLight = chunk->light.size() != kChunkVolume;
+    bool lodChanged = (chunk->lodStep != lodStep);
+    bool missingMesh = chunk->vertices.empty() || chunk->indices.empty();
+
+    if (needsLight || lodChanged || missingMesh) {
       chunk->lodStep = lodStep;
       enqueueMeshBuild(world, textures, *chunk, lodStep);
       meshScheduled++;
@@ -1395,12 +2332,13 @@ void updateWorldChunks(World& world, const TextureAssets& textures, Vec3 playerP
   }
 
   unsigned int workerCount = std::thread::hardware_concurrency();
-  if (workerCount < 2) {
+  if (workerCount == 0) {
     workerCount = 2;
   }
-  int maxInFlight = static_cast<int>(workerCount) * 3;
+  workerCount = std::min<unsigned int>(workerCount, 4);
+  int maxInFlight = static_cast<int>(workerCount) * 2;
   int available = maxInFlight - static_cast<int>(world.buildTasks.size());
-  int budget = std::max(kChunkBuildPerFrame, static_cast<int>(workerCount));
+  int budget = std::max(kChunkBuildPerFrame * 2, static_cast<int>(workerCount) * 2);
   int toCreate = std::min(available, budget);
 
   int spawned = 0;
@@ -1423,7 +2361,8 @@ void updateWorldChunks(World& world, const TextureAssets& textures, Vec3 playerP
 
 void rebuildWorldMeshes(World& world, const TextureAssets& textures) {
   for (auto& entry : world.chunks) {
-    computeChunkLight(world, entry.second);
+    recomputeChunkMetadata(entry.second);
+    computeChunkLight(world, entry.second, false);
     int lodStep = entry.second.lodStep > 0 ? entry.second.lodStep : 1;
     entry.second.lodStep = lodStep;
     enqueueMeshBuild(world, textures, entry.second, lodStep);
@@ -1443,7 +2382,8 @@ float groundHeightAt(const World& world, float x, float y, float z, bool& valid)
   }
 
   for (int wy = startY; wy >= 0; --wy) {
-    if (blockAtInternal(world, ix, wy, iz) != BlockAir) {
+    BlockType type = blockAtInternal(world, ix, wy, iz);
+    if (type != BlockAir && type != BlockWater) {
       valid = true;
       return (static_cast<float>(wy) + 1.0f) * kBlockSize;
     }
@@ -1474,7 +2414,48 @@ bool setBlockAt(World& world, int wx, int wy, int wz, BlockType type) {
   if (!chunk) {
     return false;
   }
+  int lx = floorMod(wx, kChunkSize);
+  int ly = floorMod(wy, kChunkSize);
+  int lz = floorMod(wz, kChunkSize);
+  int idx = blockIndex(lx, ly, lz);
+  uint8_t oldValue = chunk->blocks[idx];
+  uint8_t newValue = static_cast<uint8_t>(type);
   setBlockInternal(*chunk, wx, wy, wz, type);
+  
+  computeChunkLight(world, *chunk, true);
+  recomputeChunkMetadata(*chunk);
+
+  if (lx == 0 || lx == kChunkSize - 1 || 
+      ly == 0 || ly == kChunkSize - 1 ||
+      lz == 0 || lz == kChunkSize - 1) {
+    static const int kNeighborOffsets[26][3] = {
+      {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1},
+      {1, 1, 0}, {1, -1, 0}, {-1, 1, 0}, {-1, -1, 0},
+      {1, 0, 1}, {1, 0, -1}, {-1, 0, 1}, {-1, 0, -1},
+      {0, 1, 1}, {0, 1, -1}, {0, -1, 1}, {0, -1, -1},
+      {1, 1, 1}, {1, 1, -1}, {1, -1, 1}, {1, -1, -1},
+      {-1, 1, 1}, {-1, 1, -1}, {-1, -1, 1}, {-1, -1, -1},
+    };
+    
+    for (const auto& offset : kNeighborOffsets) {
+      int nx = cx + offset[0];
+      int ny = cy + offset[1];
+      int nz = cz + offset[2];
+      if (ny >= 0 && ny < kChunksY) {
+        Chunk* neighbor = findChunkInternal(world, nx, ny, nz);
+        if (neighbor && !neighbor->blocks.empty()) {
+          computeChunkLight(world, *neighbor, true);
+        }
+      }
+    }
+  }
+  
+  if (newValue != static_cast<uint8_t>(BlockAir)) {
+    chunk->isEmpty = false;
+  }
+  chunk->contentHash ^= blockHashContribution(static_cast<uint32_t>(idx), oldValue);
+  chunk->contentHash ^= blockHashContribution(static_cast<uint32_t>(idx), newValue);
+  
   return true;
 }
 
@@ -1501,10 +2482,13 @@ void rebuildChunksAround(World& world, const TextureAssets& textures, int wx, in
       continue;
     }
     Chunk* chunk = findChunkInternal(world, nx, ny, nz);
-    if (!chunk) {
+    if (!chunk || chunk->blocks.empty()) {
       continue;
     }
-    computeChunkLight(world, *chunk);
+    ChunkCoord coord = chunkCoord(nx, ny, nz);
+    if (world.queuedMeshes.find(coord) != world.queuedMeshes.end()) {
+      continue;
+    }
     int lodStep = chunk->lodStep > 0 ? chunk->lodStep : 1;
     chunk->lodStep = lodStep;
     enqueueMeshBuild(world, textures, *chunk, lodStep);
@@ -1625,7 +2609,7 @@ bool hasBlockNear(const World& world, Vec3 position, BlockType type, int radius)
 }
 
 bool isPlaceableBlock(BlockType type) {
-  return type != BlockAir && type != BlockStick;
+  return type != BlockAir && type != BlockStick && type != BlockWater;
 }
 
 float surfaceHeightAt(const World& world, float x, float z) {

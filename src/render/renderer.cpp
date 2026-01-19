@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 
 namespace {
 constexpr float kChunkSize = 16.0f;
@@ -15,17 +16,25 @@ GLint g_worldLightDirLoc = -1;
 GLint g_worldAmbientLoc = -1;
 GLint g_worldDiffuseLoc = -1;
 GLint g_worldTextureLoc = -1;
+GLint g_worldTexScaleLoc = -1;
+GLint g_worldTexOffsetLoc = -1;
+GLint g_worldAlphaMulLoc = -1;
 
 WorldLight g_worldLight = {};
 
+constexpr int kWaterFrameCount = 32;
+constexpr float kWaterFrameDuration = 0.1f;
+
 const char* kWorldVertexShader = R"(
 #version 120
+uniform vec2 uTexScale;
+uniform vec2 uTexOffset;
 varying vec2 vTexCoord;
 varying vec3 vNormal;
 varying vec4 vColor;
 void main() {
   gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex;
-  vTexCoord = gl_MultiTexCoord0.xy;
+  vTexCoord = gl_MultiTexCoord0.xy * uTexScale + uTexOffset;
   vNormal = gl_Normal;
   vColor = gl_Color;
 }
@@ -37,6 +46,7 @@ uniform sampler2D uTexture;
 uniform vec3 uLightDir;
 uniform vec3 uAmbient;
 uniform vec3 uDiffuse;
+uniform float uAlphaMul;
 varying vec2 vTexCoord;
 varying vec3 vNormal;
 varying vec4 vColor;
@@ -45,10 +55,13 @@ void main() {
   vec3 lightDir = normalize(uLightDir);
   float ndotl = max(dot(normal, lightDir), 0.0);
   vec3 light = uAmbient + uDiffuse * ndotl;
-  light = clamp(light, 0.0, 1.0);
+
+  float faceFactor = mix(0.8, 1.0, clamp(normal.y * 0.5 + 0.5, 0.0, 1.0));
+  light = clamp(light * faceFactor, 0.0, 1.0);
+  
   vec4 texel = texture2D(uTexture, vTexCoord);
   vec3 rgb = texel.rgb * vColor.rgb * light;
-  gl_FragColor = vec4(rgb, texel.a);
+  gl_FragColor = vec4(rgb, texel.a * uAlphaMul);
 }
 )";
 
@@ -103,6 +116,9 @@ bool initWorldProgram() {
   g_worldAmbientLoc = glGetUniformLocation(program, "uAmbient");
   g_worldDiffuseLoc = glGetUniformLocation(program, "uDiffuse");
   g_worldTextureLoc = glGetUniformLocation(program, "uTexture");
+  g_worldTexScaleLoc = glGetUniformLocation(program, "uTexScale");
+  g_worldTexOffsetLoc = glGetUniformLocation(program, "uTexOffset");
+  g_worldAlphaMulLoc = glGetUniformLocation(program, "uAlphaMul");
   return true;
 }
 
@@ -157,16 +173,23 @@ void setWorldLight(const WorldLight& light) {
 }
 
 void uploadVisibleChunkMeshes(World& world) {
+  int uploaded = 0;
+  int maxPerFrame = 8;
+  
   for (const ChunkCoord& coord : world.visibleChunks) {
+    if (uploaded >= maxPerFrame) {
+      break;
+    }
     Chunk* chunk = findChunkMutable(world, coord.cx, coord.cy, coord.cz);
     if (!chunk || !chunk->meshDirty) {
       continue;
     }
     uploadChunkMesh(*chunk);
+    uploaded++;
   }
 }
 
-void drawWorld(const World& world) {
+void drawWorld(const World& world, double timeNow) {
   if (g_worldProgram != 0) {
     glUseProgram(g_worldProgram);
     if (g_worldLightDirLoc >= 0) {
@@ -190,6 +213,15 @@ void drawWorld(const World& world) {
     if (g_worldTextureLoc >= 0) {
       glUniform1i(g_worldTextureLoc, 0);
     }
+    if (g_worldTexScaleLoc >= 0) {
+      glUniform2f(g_worldTexScaleLoc, 1.0f, 1.0f);
+    }
+    if (g_worldTexOffsetLoc >= 0) {
+      glUniform2f(g_worldTexOffsetLoc, 0.0f, 0.0f);
+    }
+    if (g_worldAlphaMulLoc >= 0) {
+      glUniform1f(g_worldAlphaMulLoc, 1.0f);
+    }
   }
 
   glEnableClientState(GL_VERTEX_ARRAY);
@@ -197,11 +229,24 @@ void drawWorld(const World& world) {
   glEnableClientState(GL_NORMAL_ARRAY);
   glEnableClientState(GL_COLOR_ARRAY);
 
+  unsigned int lastTextureId = 0;
+  int chunksDrawn = 0;
+  bool blending = false;
+  bool depthWrite = true;
+  bool animated = false;
+  float lastScaleY = 1.0f;
+  float lastOffsetY = 0.0f;
+  float lastAlphaMul = 1.0f;
+
   for (const ChunkCoord& coord : world.visibleChunks) {
     const Chunk* chunk = findChunk(world, coord.cx, coord.cy, coord.cz);
-    if (!chunk || chunk->vertices.empty() || chunk->indices.empty() || chunk->batches.empty()) {
+    if (!chunk || chunk->vertices.empty() || chunk->indices.empty() || chunk->batches.empty() || chunk->blocks.empty()) {
       continue;
     }
+    if (chunk->vbo == 0 || chunk->ibo == 0) {
+      continue;
+    }
+    ++chunksDrawn;
     glPushMatrix();
     glTranslatef(static_cast<float>(coord.cx) * kChunkSize,
                  static_cast<float>(coord.cy) * kChunkSize,
@@ -214,7 +259,50 @@ void drawWorld(const World& world) {
     glColorPointer(3, GL_UNSIGNED_BYTE, sizeof(Vertex), reinterpret_cast<void*>(offsetof(Vertex, r)));
 
     for (const MeshBatch& batch : chunk->batches) {
-      glBindTexture(GL_TEXTURE_2D, batch.textureId);
+      if (batch.textureId != lastTextureId) {
+        glBindTexture(GL_TEXTURE_2D, batch.textureId);
+        lastTextureId = batch.textureId;
+      }
+      if (batch.transparent != blending) {
+        if (batch.transparent) {
+          glEnable(GL_BLEND);
+          glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+          glDepthMask(GL_FALSE);
+          depthWrite = false;
+        } else {
+          glDisable(GL_BLEND);
+          glDepthMask(GL_TRUE);
+          depthWrite = true;
+        }
+        blending = batch.transparent;
+      }
+      if (batch.animated != animated) {
+        animated = batch.animated;
+      }
+      if (g_worldProgram != 0 && (g_worldTexScaleLoc >= 0 || g_worldTexOffsetLoc >= 0)) {
+        float scaleY = 1.0f;
+        float offsetY = 0.0f;
+        if (animated) {
+          int frame = static_cast<int>(std::floor(timeNow / kWaterFrameDuration)) % kWaterFrameCount;
+          scaleY = 1.0f / static_cast<float>(kWaterFrameCount);
+          offsetY = scaleY * static_cast<float>(frame);
+        }
+        if (scaleY != lastScaleY && g_worldTexScaleLoc >= 0) {
+          glUniform2f(g_worldTexScaleLoc, 1.0f, scaleY);
+          lastScaleY = scaleY;
+        }
+        if (offsetY != lastOffsetY && g_worldTexOffsetLoc >= 0) {
+          glUniform2f(g_worldTexOffsetLoc, 0.0f, offsetY);
+          lastOffsetY = offsetY;
+        }
+      }
+      if (g_worldProgram != 0 && g_worldAlphaMulLoc >= 0) {
+        float alphaMul = animated ? 0.7f : 1.0f;
+        if (alphaMul != lastAlphaMul) {
+          glUniform1f(g_worldAlphaMulLoc, alphaMul);
+          lastAlphaMul = alphaMul;
+        }
+      }
       glDrawElements(GL_TRIANGLES,
                      batch.indexCount,
                      GL_UNSIGNED_INT,
@@ -229,6 +317,12 @@ void drawWorld(const World& world) {
   glDisableClientState(GL_NORMAL_ARRAY);
   glDisableClientState(GL_TEXTURE_COORD_ARRAY);
   glDisableClientState(GL_VERTEX_ARRAY);
+  if (blending) {
+    glDisable(GL_BLEND);
+  }
+  if (!depthWrite) {
+    glDepthMask(GL_TRUE);
+  }
 
   if (g_worldProgram != 0) {
     glUseProgram(0);

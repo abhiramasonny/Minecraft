@@ -14,6 +14,7 @@ void initInventory(Inventory& inventory) {
   inventory.hotbar[2] = {BlockStone, kStackSize};
   inventory.hotbar[3] = {BlockWood, kStackSize};
   inventory.hotbar[4] = {BlockLeaves, kStackSize};
+  inventory.hotbar[5] = {BlockTorch, kStackSize};
 }
 
 void setSelectedSlot(Inventory& inventory, int index) {

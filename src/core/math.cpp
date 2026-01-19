@@ -56,7 +56,17 @@ Mat4 perspective(float fovDegrees, float aspect, float nearZ, float farZ) {
 
 Mat4 lookAt(Vec3 eye, Vec3 center, Vec3 up) {
   Vec3 f = normalize(center - eye);
-  Vec3 r = normalize(cross(f, up));
+  Vec3 r = cross(f, up);
+  
+  float rLen = std::sqrt(r.x * r.x + r.y * r.y + r.z * r.z);
+  if (rLen < 0.0001f) {
+    if (std::abs(f.y) < 0.9f) {
+      r = cross(f, {0.0f, 1.0f, 0.0f});
+    } else {
+      r = cross(f, {1.0f, 0.0f, 0.0f});
+    }
+  }
+  r = normalize(r);
   Vec3 u = cross(r, f);
 
   Mat4 out = {};

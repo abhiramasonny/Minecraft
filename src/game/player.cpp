@@ -5,23 +5,40 @@ constexpr float kMoveSpeed = 5.0f;
 constexpr float kSprintMultiplier = 1.7f;
 constexpr float kGravity = -18.0f;
 constexpr float kJumpVelocity = 7.35f;
-constexpr float kPlayerHeight = 1.7f;
+constexpr float kPlayerHeight = 1.8f;
 constexpr float kPlayerRadius = 0.35f;
 constexpr float kCollisionEpsilon = 0.001f;
 constexpr float kResolveStep = 0.1f;
 constexpr float kResolveMax = 2.5f;
+constexpr float kResolveMaxDown = 0.6f;
 constexpr double kDoubleTapWindow = 0.25;
 
 const Vec3 kWorldUp = {0.0f, 1.0f, 0.0f};
 }
 
 static void updateCameraVectors(Player& player) {
+  if (player.pitch > 89.9f) {
+    player.pitch = 89.9f;
+  }
+  if (player.pitch < -89.9f) {
+    player.pitch = -89.9f;
+  }
+  
   Vec3 front;
   front.x = std::cos(radians(player.yaw)) * std::cos(radians(player.pitch));
   front.y = std::sin(radians(player.pitch));
   front.z = std::sin(radians(player.yaw)) * std::cos(radians(player.pitch));
   player.front = normalize(front);
-  player.right = normalize(cross(player.front, kWorldUp));
+  
+  Vec3 right = cross(player.front, kWorldUp);
+  float rightLen = std::sqrt(right.x * right.x + right.y * right.y + right.z * right.z);
+  
+  if (rightLen > 0.0001f) {
+    player.right = {right.x / rightLen, right.y / rightLen, right.z / rightLen};
+  } else {
+    player.right = {1.0f, 0.0f, 0.0f};
+  }
+  
   player.up = normalize(cross(player.right, player.front));
 }
 
@@ -72,7 +89,7 @@ void handlePlayerMouse(Player& player, double xpos, double ypos) {
 }
 
 static bool isSolidBlock(BlockType type) {
-  return type != BlockAir && type != BlockStick;
+  return type != BlockAir && type != BlockStick && type != BlockWater && type != BlockTorch;
 }
 
 static bool collidesAt(const World& world, const Vec3& position) {
@@ -117,7 +134,7 @@ static bool resolvePenetration(Player& player, const World& world) {
     }
   }
 
-  for (float offset = kResolveStep; offset <= kResolveMax; offset += kResolveStep) {
+  for (float offset = kResolveStep; offset <= kResolveMaxDown; offset += kResolveStep) {
     Vec3 test = base;
     test.y -= offset;
     if (!collidesAt(world, test)) {
@@ -126,10 +143,42 @@ static bool resolvePenetration(Player& player, const World& world) {
     }
   }
 
+  const Vec3 directions[] = {
+    {1.0f, 0.0f, 0.0f},
+    {-1.0f, 0.0f, 0.0f},
+    {0.0f, 0.0f, 1.0f},
+    {0.0f, 0.0f, -1.0f},
+    {0.7071f, 0.0f, 0.7071f},
+    {-0.7071f, 0.0f, 0.7071f},
+    {0.7071f, 0.0f, -0.7071f},
+    {-0.7071f, 0.0f, -0.7071f},
+  };
+
+  for (float radius = kResolveStep; radius <= kResolveMax; radius += kResolveStep) {
+    for (const Vec3& dir : directions) {
+      Vec3 planar = {dir.x * radius, 0.0f, dir.z * radius};
+      for (float yOffset = 0.0f; yOffset <= kResolveMax; yOffset += kResolveStep) {
+        Vec3 test = {base.x + planar.x, base.y + yOffset, base.z + planar.z};
+        if (!collidesAt(world, test)) {
+          player.position = test;
+          return true;
+        }
+        if (yOffset > 0.0f && yOffset <= kResolveMaxDown) {
+          test.y = base.y - yOffset;
+          if (!collidesAt(world, test)) {
+            player.position = test;
+            return true;
+          }
+        }
+      }
+    }
+  }
+
   return false;
 }
 
 void movePlayer(Player& player, const World& world, const PlayerInput& input, float deltaTime) {
+  resolvePenetration(player, world);
   float speed = kMoveSpeed * (input.sprint ? kSprintMultiplier : 1.0f);
   float velocity = speed * deltaTime;
 
@@ -208,22 +257,28 @@ void updatePlayerPhysics(Player& player, const World& world, float deltaTime) {
 
   player.verticalVelocity += kGravity * deltaTime;
   float deltaY = player.verticalVelocity * deltaTime;
+  player.grounded = false;
   if (deltaY != 0.0f) {
-    Vec3 next = player.position;
-    next.y += deltaY;
-    if (!collidesAt(world, next)) {
-      player.position.y = next.y;
-      player.grounded = false;
-    } else if (deltaY < 0.0f) {
-      bool validGround = false;
-      float groundHeight = groundHeightAt(world, player.position.x, player.position.y, player.position.z, validGround);
-      if (validGround) {
-        player.position.y = groundHeight + kPlayerHeight;
+    float remaining = std::abs(deltaY);
+    float direction = deltaY > 0.0f ? 1.0f : -1.0f;
+    float step = 0.05f;
+    while (remaining > 0.0f) {
+      float move = std::min(step, remaining) * direction;
+      Vec3 next = player.position;
+      next.y += move;
+      if (!collidesAt(world, next)) {
+        player.position.y = next.y;
+        remaining -= std::abs(move);
+        continue;
       }
-      player.verticalVelocity = 0.0f;
-      player.grounded = true;
-    } else {
-      player.verticalVelocity = 0.0f;
+
+      if (direction < 0.0f) {
+        player.verticalVelocity = 0.0f;
+        player.grounded = true;
+      } else {
+        player.verticalVelocity = 0.0f;
+      }
+      break;
     }
   }
 
