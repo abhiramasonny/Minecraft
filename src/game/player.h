@@ -14,7 +14,10 @@ struct Player {
   bool flyMode;
   bool grounded;
   bool prevJumpDown;
+  bool prevForwardDown;
   double lastJumpTap;
+  double lastForwardTap;
+  bool speedBoostEnabled;
   bool firstMouse;
   double lastMouseX;
   double lastMouseY;
@@ -37,3 +40,6 @@ void movePlayer(Player& player, const World& world, const PlayerInput& input, fl
 void updatePlayerPhysics(Player& player, const World& world, float deltaTime);
 void syncPlayerCamera(Player& player);
 bool playerIntersectsBlock(const Player& player, int wx, int wy, int wz);
+
+float playerRadius();
+float playerHeight();

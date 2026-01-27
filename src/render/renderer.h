@@ -1,6 +1,8 @@
 #pragma once
 
 #include "game/world.h"
+#include "render/metal_raytracer.h"
+#include <memory>
 
 struct WorldLight {
   Vec3 direction;
@@ -15,3 +17,8 @@ void uploadVisibleChunkMeshes(World& world);
 void drawWorld(const World& world, double timeNow);
 void drawBlockOutline(int wx, int wy, int wz);
 void drawChunkBounds(const World& world);
+
+void enableRaytracing(bool enabled);
+bool isRaytracingEnabled();
+void setRaytracingConfig(const MetalRT::RaytracerConfig& config);
+MetalRT::MetalRaytracer* getRaytracer();

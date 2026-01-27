@@ -63,6 +63,13 @@ void loadTextures(TextureAssets& textures) {
   textures.woodTop = loadTexture("textures/blocks/log_oak_top.png", 140, 100, 70);
   textures.woodSide = loadTexture("textures/blocks/log_big_oak.png", 120, 90, 60);
   textures.leaves = loadTexture("textures/blocks/leaves_oak_opaque.png", 90, 130, 90);
+  textures.birchWoodTop = loadTexture("textures/blocks/log_birch_top.png", 200, 200, 160);
+  textures.birchWoodSide = loadTexture("textures/blocks/log_birch.png", 210, 210, 170);
+  textures.birchLeaves = loadTexture("textures/blocks/leaves_birch_opaque.png", 110, 170, 110);
+  textures.spruceWoodTop = loadTexture("textures/blocks/log_spruce_top.png", 110, 90, 60);
+  textures.spruceWoodSide = loadTexture("textures/blocks/log_spruce.png", 90, 70, 50);
+  textures.spruceLeaves = loadTexture("textures/blocks/leaves_spruce_opaque.png", 70, 120, 70);
+  textures.snow = loadTexture("textures/blocks/snow.png", 230, 230, 240);
   textures.planks = loadTexture("textures/blocks/planks_oak.png", 150, 120, 90);
   textures.craftingTop = loadTexture("textures/blocks/crafting_table_top.png", 170, 130, 90);
   textures.craftingSide = loadTexture("textures/blocks/crafting_table_side.png", 160, 120, 80);

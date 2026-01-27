@@ -3,6 +3,7 @@
 namespace {
 constexpr float kMoveSpeed = 5.0f;
 constexpr float kSprintMultiplier = 1.7f;
+constexpr float kSpeedBoostMultiplier = 10.0f;
 constexpr float kGravity = -18.0f;
 constexpr float kJumpVelocity = 7.35f;
 constexpr float kPlayerHeight = 1.8f;
@@ -14,6 +15,14 @@ constexpr float kResolveMaxDown = 0.6f;
 constexpr double kDoubleTapWindow = 0.25;
 
 const Vec3 kWorldUp = {0.0f, 1.0f, 0.0f};
+}
+
+float playerRadius() {
+  return kPlayerRadius;
+}
+
+float playerHeight() {
+  return kPlayerHeight;
 }
 
 static void updateCameraVectors(Player& player) {
@@ -54,7 +63,10 @@ void initPlayer(Player& player) {
   player.flyMode = false;
   player.grounded = false;
   player.prevJumpDown = false;
+  player.prevForwardDown = false;
   player.lastJumpTap = -10.0;
+  player.lastForwardTap = -10.0;
+  player.speedBoostEnabled = false;
 
   player.firstMouse = true;
   player.lastMouseX = 0.0f;
@@ -179,7 +191,20 @@ static bool resolvePenetration(Player& player, const World& world) {
 
 void movePlayer(Player& player, const World& world, const PlayerInput& input, float deltaTime) {
   resolvePenetration(player, world);
-  float speed = kMoveSpeed * (input.sprint ? kSprintMultiplier : 1.0f);
+
+  if (input.forward && !player.prevForwardDown) {
+    if (input.timeNow - player.lastForwardTap <= kDoubleTapWindow) {
+      player.speedBoostEnabled = !player.speedBoostEnabled;
+    }
+    player.lastForwardTap = input.timeNow;
+  }
+  player.prevForwardDown = input.forward;
+
+  float speedMul = (input.sprint ? kSprintMultiplier : 1.0f);
+  if (player.speedBoostEnabled) {
+    speedMul *= kSpeedBoostMultiplier;
+  }
+  float speed = kMoveSpeed * speedMul;
   float velocity = speed * deltaTime;
 
   Vec3 flatFront = normalize({player.front.x, 0.0f, player.front.z});

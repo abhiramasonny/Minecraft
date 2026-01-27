@@ -14,6 +14,13 @@ struct TextureAssets {
   Texture woodTop;
   Texture woodSide;
   Texture leaves;
+  Texture birchWoodTop;
+  Texture birchWoodSide;
+  Texture birchLeaves;
+  Texture spruceWoodTop;
+  Texture spruceWoodSide;
+  Texture spruceLeaves;
+  Texture snow;
   Texture planks;
   Texture craftingTop;
   Texture craftingSide;

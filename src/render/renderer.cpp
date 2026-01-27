@@ -5,7 +5,10 @@
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cmath>
+#include <memory>
+#include <string_view>
 
 namespace {
 constexpr float kChunkSize = 16.0f;
@@ -21,6 +24,18 @@ GLint g_worldTexOffsetLoc = -1;
 GLint g_worldAlphaMulLoc = -1;
 
 WorldLight g_worldLight = {};
+
+std::unique_ptr<MetalRT::MetalRaytracer> g_raytracer;
+bool g_raytracingEnabled = false;
+
+bool envEnablesRaytracing() {
+  const char* value = std::getenv("MTFC_ENABLE_RAYTRACING");
+  if (!value) {
+    return false;
+  }
+  std::string_view v(value);
+  return v == "1" || v == "true" || v == "TRUE" || v == "on" || v == "ON";
+}
 
 constexpr int kWaterFrameCount = 32;
 constexpr float kWaterFrameDuration = 0.1f;
@@ -151,11 +166,63 @@ void uploadChunkMesh(Chunk& chunk) {
   glBindBuffer(GL_ARRAY_BUFFER, 0);
   chunk.meshDirty = false;
 }
-} // namespace
+}
+
+void enableRaytracing(bool enabled) {
+  if (enabled == g_raytracingEnabled) {
+    return;
+  }
+
+  if (!enabled) {
+    g_raytracingEnabled = false;
+    if (g_raytracer) {
+      g_raytracer->shutdown();
+      g_raytracer.reset();
+    }
+    return;
+  }
+
+  g_raytracingEnabled = true;
+  if (!g_raytracer) {
+    g_raytracer = std::make_unique<MetalRT::MetalRaytracer>();
+    if (!g_raytracer->initialize(1920, 1080)) {
+      std::fprintf(stderr, "Metal ray tracer initialization failed; ray tracing disabled.\n");
+      g_raytracer.reset();
+      g_raytracingEnabled = false;
+      return;
+    }
+
+    MetalRT::RaytracerConfig config;
+    config.samplesPerPixel = 1;
+    config.maxBounces = 1;
+    config.enableDenoising = true;
+    config.enableAccumulation = true;
+    config.exposure = 1.0f;
+    g_raytracer->setConfig(config);
+  }
+}
+
+bool isRaytracingEnabled() {
+  return g_raytracingEnabled && g_raytracer != nullptr;
+}
+
+void setRaytracingConfig(const MetalRT::RaytracerConfig& config) {
+  if (g_raytracer) {
+    g_raytracer->setConfig(config);
+  }
+}
+
+MetalRT::MetalRaytracer* getRaytracer() {
+  return g_raytracer.get();
+}
 
 void initRenderer() {
   if (!initWorldProgram()) {
     std::fprintf(stderr, "World shader unavailable; using fixed pipeline.\n");
+  }
+
+  if (envEnablesRaytracing()) {
+    enableRaytracing(true);
   }
 }
 
@@ -164,6 +231,8 @@ void shutdownRenderer() {
     glDeleteProgram(g_worldProgram);
     g_worldProgram = 0;
   }
+
+  enableRaytracing(false);
 }
 
 void setWorldLight(const WorldLight& light) {
@@ -186,6 +255,10 @@ void uploadVisibleChunkMeshes(World& world) {
     }
     uploadChunkMesh(*chunk);
     uploaded++;
+  }
+  
+  if (g_raytracingEnabled && g_raytracer) {
+    g_raytracer->uploadWorldMeshes(world);
   }
 }
 

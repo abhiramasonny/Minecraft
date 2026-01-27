@@ -37,6 +37,7 @@ struct AppState {
   bool prevDayNightToggleDown;
   bool prevBreakDown;
   bool prevPlaceDown;
+  bool prevSpawnCowDown;
   bool showChunkBounds;
   bool showWireframe;
   bool showCoords;
@@ -312,6 +313,7 @@ static void initApp(AppState& app) {
   app.prevDayNightToggleDown = false;
   app.prevBreakDown = false;
   app.prevPlaceDown = false;
+  app.prevSpawnCowDown = false;
   app.showChunkBounds = false;
   app.showWireframe = false;
   app.showCoords = false;
@@ -340,6 +342,53 @@ static void applyVideoSettings(AppState& app) {
   app.world.renderDistance = std::max(kMinRenderDistance, std::min(kMaxRenderDistance, app.renderDistanceSetting));
 }
 
+static void spawnCowsNearPlayer(AppState& app, int count) {
+  Vec3 base = app.player.position;
+  for (int i = 0; i < count; ++i) {
+    float angle = (static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX)) * 6.2831853f;
+    float dist = 2.5f + (static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX)) * 4.0f;
+    float x = base.x + std::cos(angle) * dist;
+    float z = base.z + std::sin(angle) * dist;
+    float y = surfaceHeightAt(app.world, x, z);
+    spawnCow(app.entityManager, {x, y, z});
+  }
+}
+
+static void spawnStarterEntities(AppState& app) {
+  app.entityManager.entities.clear();
+
+  Vec3 base = app.player.position;
+
+  float maxDist = static_cast<float>(app.world.renderDistance * 16) * 0.85f;
+  float minDist = 14.0f;
+  float minSeparation = 10.0f;
+  int cowCount = 18;
+  int attempts = 0;
+  while (static_cast<int>(app.entityManager.entities.size()) < cowCount && attempts < cowCount * 40) {
+    attempts++;
+    float angle = (static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX)) * 6.2831853f;
+    float t = (static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX));
+    float dist = minDist + t * (maxDist - minDist);
+    float x = base.x + std::cos(angle) * dist;
+    float z = base.z + std::sin(angle) * dist;
+    float y = surfaceHeightAt(app.world, x, z);
+
+    bool tooClose = false;
+    for (const Entity& e : app.entityManager.entities) {
+      float dx = e.position.x - x;
+      float dz = e.position.z - z;
+      if (dx * dx + dz * dz < minSeparation * minSeparation) {
+        tooClose = true;
+        break;
+      }
+    }
+    if (tooClose) {
+      continue;
+    }
+    spawnCow(app.entityManager, {x, y, z});
+  }
+}
+
 static void startNewWorld(AppState& app) {
   initWorld(app.world);
   initPlayer(app.player);
@@ -350,13 +399,16 @@ static void startNewWorld(AppState& app) {
   applyVideoSettings(app);
   float surface = surfaceHeightAt(app.world, app.player.position.x, app.player.position.z);
   app.player.position.y = surface + 2.0f;
+  spawnStarterEntities(app);
 }
 
 static bool loadExistingWorld(AppState& app) {
   bool loaded = loadGame("save/world.bin", app.world, app.player, app.inventory, app.textures);
+  initEntityManager(app.entityManager);
   app.renderDistanceSetting = app.world.renderDistance;
   app.seedSetting = app.world.seed;
   applyVideoSettings(app);
+  spawnStarterEntities(app);
   return loaded;
 }
 
@@ -641,6 +693,12 @@ int main() {
       toggleFlag(glfwGetKey(window, GLFW_KEY_N) == GLFW_PRESS,
                  app.prevDayNightToggleDown, app.dayNightPaused);
 
+      bool spawnDown = glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS;
+      if (spawnDown && !app.prevSpawnCowDown && !app.ui.inventoryOpen) {
+        spawnCowsNearPlayer(app, 2);
+      }
+      app.prevSpawnCowDown = spawnDown;
+
       if (app.dayNightPaused && !app.ui.inventoryOpen) {
         bool scrubLeft = glfwGetKey(window, GLFW_KEY_LEFT_BRACKET) == GLFW_PRESS;
         bool scrubRight = glfwGetKey(window, GLFW_KEY_RIGHT_BRACKET) == GLFW_PRESS;
@@ -723,6 +781,7 @@ int main() {
     if (app.mode == GameMode::Playing) {
       updatePlayerPhysics(app.player, app.world, deltaTime);
       updateEntities(app.entityManager, app.world, app.player.position, deltaTime);
+      resolvePlayerEntityCollisions(app.player, app.entityManager);
     }
 
     float aspect = static_cast<float>(width) / static_cast<float>(height);

@@ -30,6 +30,11 @@ enum BlockType : uint8_t {
   BlockStick = 16,
   BlockWater = 17,
   BlockTorch = 18,
+  BlockBirchWood = 19,
+  BlockBirchLeaves = 20,
+  BlockSpruceWood = 21,
+  BlockSpruceLeaves = 22,
+  BlockSnow = 23,
 };
 
 struct Vertex {
@@ -71,6 +76,8 @@ struct Chunk {
   uint8_t faceOpenMask;
   uint64_t contentHash;
   uint64_t lastMeshHash;
+  uint64_t desiredMeshHash;
+  uint64_t inFlightMeshHash;
   bool isEmpty;
   bool isSolid;
   double lastAccessTime;
@@ -100,6 +107,7 @@ struct ChunkCoordHash {
 struct MeshBuildResult {
   ChunkCoord coord;
   int lodStep;
+  uint64_t meshKey;
   std::vector<Vertex> vertices;
   std::vector<uint32_t> indices;
   std::vector<MeshBatch> batches;

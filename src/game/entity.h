@@ -5,6 +5,8 @@
 #include <vector>
 #include <memory>
 
+struct Player;
+
 enum EntityType {
   EntityCow = 0,
 };
@@ -16,6 +18,7 @@ struct Entity {
   float yaw;
   float pitch;
   float width;
+  float length;
   float height;
   bool onGround;
   float walkTimer;
@@ -35,3 +38,4 @@ void spawnCow(EntityManager& manager, Vec3 position);
 void updateEntities(EntityManager& manager, const World& world, const Vec3& playerPos, float deltaTime);
 void renderEntities(const EntityManager& manager, Vec3 cameraPos);
 void loadEntityTextures(EntityManager& manager);
+void resolvePlayerEntityCollisions(Player& player, const EntityManager& manager);
